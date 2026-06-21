@@ -135,6 +135,9 @@ model SystemStatus {
   pollerStatus        String   @default("unknown")
   watchRenewStatus    String   @default("unknown")
   formProcessStatus   String   @default("unknown")
+  // Alert deduplication
+  lastAlertHash       String?
+  lastAlertSentAt     DateTime?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
