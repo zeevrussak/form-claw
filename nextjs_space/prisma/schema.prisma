@@ -1,0 +1,142 @@
+generator client {
+    provider = "prisma-client-js"
+    binaryTargets = ["native", "linux-musl-arm64-openssl-3.0.x"]
+    output = "/home/ubuntu/form_filler_dashboard/nextjs_space/node_modules/.prisma/client"
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+  password      String?
+  role          String    @default("user")
+  accounts      Account[]
+  sessions      Session[]
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model FormProcessingLog {
+  id                      Int       @id @default(autoincrement())
+  email_message_id        String    @unique
+  received_at             DateTime? @db.Timestamptz(6)
+  sender_email            String?
+  sender_name             String?
+  subject                 String?
+  attachment_filename     String?
+  attachment_type         String?
+  attachment_count        Int?      @default(0)
+  page_count              Int?
+  target_person           String?
+  signer                  String?
+  processing_status       String    @default("processing")
+  processing_started_at   DateTime? @db.Timestamptz(6)
+  processing_completed_at DateTime? @db.Timestamptz(6)
+  processing_time_seconds Decimal?  @db.Decimal(10, 2)
+  filled_pdf_filename     String?
+  error_message           String?
+  error_type              String?
+  instructions_detected   String?
+  marked_as_read          Boolean?  @default(false)
+  created_at              DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at              DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@index([created_at(sort: Desc)], map: "idx_fpl_created_at")
+  @@index([processing_status], map: "idx_fpl_processing_status")
+  @@index([received_at(sort: Desc)], map: "idx_fpl_received_at")
+  @@index([sender_email], map: "idx_fpl_sender_email")
+  @@map("form_processing_logs")
+}
+
+model AppConfig {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  label     String?
+  category  String   @default("general")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([category])
+  @@map("app_config")
+}
+
+model KnowledgeEntry {
+  id              String   @id @default(cuid())
+  category        String   @default("general")
+  key             String
+  value           String
+  source          String   @default("manual")
+  language        String   @default("both")
+  appliesToPerson String?
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([category])
+  @@index([appliesToPerson])
+  @@index([isActive])
+  @@map("knowledge_entries")
+}
+
+model SystemStatus {
+  id                  String   @id @default(cuid())
+  gmailWatchActive    Boolean  @default(false)
+  watchExpiration     DateTime?
+  lastWatchRenewal    DateTime?
+  lastSuccessfulForm  DateTime?
+  pollingEnabled      Boolean  @default(false)
+  webhookEnabled      Boolean  @default(true)
+  // Daemon health tracking
+  lastPollerRun       DateTime?
+  lastWatchRenewRun   DateTime?
+  lastFormProcessRun  DateTime?
+  pollerStatus        String   @default("unknown")
+  watchRenewStatus    String   @default("unknown")
+  formProcessStatus   String   @default("unknown")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@map("system_status")
+}
