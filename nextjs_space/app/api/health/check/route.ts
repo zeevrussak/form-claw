@@ -26,23 +26,21 @@ export async function GET(req: NextRequest) {
     }
 
     const now = Date.now();
-    const WATCH_STALE_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
+    const FORM_PROC_STALE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days — form processor is event-driven, only alert if truly stale
 
-    const watchAge = systemStatus.lastWatchRenewRun ? now - systemStatus.lastWatchRenewRun.getTime() : null;
-
-    const watchStale = watchAge === null || watchAge > WATCH_STALE_MS;
-    const watchError = systemStatus.watchRenewStatus === 'error';
+    const formAge = systemStatus.lastFormProcessRun ? now - systemStatus.lastFormProcessRun.getTime() : null;
+    const formError = systemStatus.formProcessStatus === 'error';
 
     const alerts: string[] = [];
-    if (watchStale) alerts.push(`Watch Renewal is STALE (last run: ${watchAge ? Math.round(watchAge / 60000) + 'm ago' : 'never'})`);
-    if (watchError) alerts.push('Watch Renewal reported ERROR status');
+    if (formError) alerts.push('Form Processor reported ERROR status');
+    if (formAge !== null && formAge > FORM_PROC_STALE_MS) alerts.push(`Form Processor hasn\'t run in ${Math.round(formAge / 86400000)}d`);
 
     if (alerts.length > 0) {
       // Create a fingerprint of the current alert set (ignoring volatile age values)
       const alertFingerprint = createHash('sha256')
         .update([
-          watchStale ? 'watch_stale' : '',
-          watchError ? 'watch_error' : '',
+          formError ? 'form_error' : '',
+          (formAge !== null && formAge > FORM_PROC_STALE_MS) ? 'form_stale' : '',
         ].filter(Boolean).sort().join('|'))
         .digest('hex')
         .slice(0, 16);
@@ -67,8 +65,8 @@ export async function GET(req: NextRequest) {
                 </ul>
               </div>
               <div style="background: #f9fafb; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                <p style="margin: 5px 0; font-size: 14px;"><strong>Watch Status:</strong> ${systemStatus.watchRenewStatus} | Last: ${systemStatus.lastWatchRenewRun?.toISOString() ?? 'Never'}</p>
-                <p style="margin: 5px 0; font-size: 14px;"><strong>Form Proc:</strong> ${systemStatus.formProcessStatus} | Last: ${systemStatus.lastFormProcessRun?.toISOString() ?? 'Never'}</p>
+                <p style="margin: 5px 0; font-size: 14px;"><strong>Email Source:</strong> ${systemStatus.emailSource ?? 'cloudflare'}</p>
+                <p style="margin: 5px 0; font-size: 14px;"><strong>Form Processor:</strong> ${systemStatus.formProcessStatus} | Last: ${systemStatus.lastFormProcessRun?.toISOString() ?? 'Never'}</p>
               </div>
               <p style="color: #666; font-size: 12px;">Check time: ${new Date().toISOString()}</p>
               <p style="margin-top: 15px;"><a href="${appUrl}/system" style="color: #2563eb;">View System Status →</a></p>

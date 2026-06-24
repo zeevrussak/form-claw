@@ -33,20 +33,16 @@ interface DaemonInfo {
 }
 
 interface SystemData {
-  gmailWatch: {
-    active: boolean;
-    expiration: string | null;
-    lastRenewal: string | null;
-  };
+  emailSource: string;
   database: {
     connected: boolean;
     totalRecords: number;
   };
   webhookEnabled: boolean;
   lastSuccessfulForm: string | null;
+  lastCloudflareEmail: string | null;
   whitelist: string[];
   daemonHealth?: {
-    watchRenewal: DaemonInfo;
     formProcessor: DaemonInfo;
   };
 }
@@ -119,28 +115,32 @@ export function SystemClient() {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        {/* Gmail Watch */}
+        {/* Email Intake */}
         <Card className="bg-white/5 border-white/10">
           <CardHeader>
             <CardTitle className="text-white flex items-center gap-2">
-              <Mail className="h-5 w-5 text-blue-400" />
-              Gmail Watch
+              <Mail className="h-5 w-5 text-orange-400" />
+              Email Intake
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex items-center justify-between">
-              <span className="text-sm text-slate-400">Status</span>
-              <Badge variant="outline" className={data?.gmailWatch?.active ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' : 'bg-red-500/20 text-red-300 border-red-500/30'}>
-                {loading ? '...' : data?.gmailWatch?.active ? 'Active' : 'Inactive'}
+              <span className="text-sm text-slate-400">Source</span>
+              <Badge variant="outline" className="bg-orange-500/20 text-orange-300 border-orange-500/30">
+                {loading ? '...' : 'Cloudflare Email'}
               </Badge>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-sm text-slate-400">Expiration</span>
-              <span className="text-sm text-white font-mono">{loading ? '...' : formatDate(data?.gmailWatch?.expiration)}</span>
+              <span className="text-sm text-slate-400">Address</span>
+              <span className="text-sm text-white font-mono">formclaw@savlil.com</span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-sm text-slate-400">Last Renewal</span>
-              <span className="text-sm text-white font-mono">{loading ? '...' : formatDate(data?.gmailWatch?.lastRenewal)}</span>
+              <span className="text-sm text-slate-400">Reply via</span>
+              <span className="text-sm text-white font-mono">Resend API</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-slate-400">Last Email</span>
+              <span className="text-sm text-white font-mono">{loading ? '...' : formatDate(data?.lastCloudflareEmail)}</span>
             </div>
           </CardContent>
         </Card>
@@ -167,12 +167,12 @@ export function SystemClient() {
           </CardContent>
         </Card>
 
-        {/* Intake Channels */}
+        {/* Processing Toggle */}
         <Card className="bg-white/5 border-white/10">
           <CardHeader>
             <CardTitle className="text-white flex items-center gap-2">
-              <Radio className="h-5 w-5 text-orange-400" />
-              Intake Channels
+              <Zap className="h-5 w-5 text-cyan-400" />
+              Processing
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-5">
@@ -180,8 +180,8 @@ export function SystemClient() {
               <div className="flex items-center gap-3">
                 <Wifi className="h-4 w-4 text-cyan-400" />
                 <div>
-                  <p className="text-sm text-white font-medium">Webhook (Pub/Sub)</p>
-                  <p className="text-xs text-slate-500">Real-time push notifications</p>
+                  <p className="text-sm text-white font-medium">Form Processing</p>
+                  <p className="text-xs text-slate-500">Cloudflare → Webhook → Fill → Resend</p>
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -191,13 +191,6 @@ export function SystemClient() {
                   onCheckedChange={(v) => toggleSetting('webhookEnabled', v)}
                   disabled={loading || savingWebhook}
                 />
-              </div>
-            </div>
-            <div className="flex items-center gap-3 py-1">
-              <XCircle className="h-4 w-4 text-slate-600" />
-              <div>
-                <p className="text-sm text-slate-500 font-medium">Polling Bridge</p>
-                <p className="text-xs text-slate-400">Removed — webhook only</p>
               </div>
             </div>
           </CardContent>
@@ -234,19 +227,13 @@ export function SystemClient() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 gap-4">
               {[
-                {
-                  label: 'Watch Renewal',
-                  icon: <Mail className="h-4 w-4 text-blue-400" />,
-                  info: data?.daemonHealth?.watchRenewal,
-                  interval: 'Every 2 days',
-                },
                 {
                   label: 'Form Processor',
                   icon: <FileText className="h-4 w-4 text-teal-400" />,
                   info: data?.daemonHealth?.formProcessor,
-                  interval: 'Event-driven',
+                  interval: 'Event-driven (Cloudflare → Webhook)',
                 },
               ].map((d) => {
                 const info = d.info;

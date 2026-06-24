@@ -23,31 +23,19 @@ export async function GET(req: NextRequest) {
     ]);
 
     const now = Date.now();
-    const WATCH_STALE_MS = 3 * 24 * 60 * 60 * 1000;
-
-    const watchAge = systemStatus?.lastWatchRenewRun ? now - new Date(systemStatus.lastWatchRenewRun).getTime() : null;
     const formAge = systemStatus?.lastFormProcessRun ? now - new Date(systemStatus.lastFormProcessRun).getTime() : null;
 
     return NextResponse.json({
-      gmailWatch: {
-        active: systemStatus?.gmailWatchActive ?? false,
-        expiration: systemStatus?.watchExpiration?.toISOString?.() ?? null,
-        lastRenewal: systemStatus?.lastWatchRenewal?.toISOString?.() ?? null,
-      },
+      emailSource: systemStatus?.emailSource ?? 'cloudflare',
       database: {
         connected: dbCheck ?? false,
         totalRecords: totalLogs ?? 0,
       },
       webhookEnabled: systemStatus?.webhookEnabled ?? true,
       lastSuccessfulForm: (lastSuccess as any)?.received_at?.toISOString?.() ?? null,
+      lastCloudflareEmail: systemStatus?.lastCloudflareEmail?.toISOString?.() ?? null,
       whitelist: WHITELISTED_EMAILS.filter(e => e !== 'john@doe.com'),
       daemonHealth: {
-        watchRenewal: {
-          lastRun: systemStatus?.lastWatchRenewRun?.toISOString?.() ?? null,
-          status: systemStatus?.watchRenewStatus ?? 'unknown',
-          stale: watchAge === null || watchAge > WATCH_STALE_MS,
-          ageMinutes: watchAge !== null ? Math.round(watchAge / 60000) : null,
-        },
         formProcessor: {
           lastRun: systemStatus?.lastFormProcessRun?.toISOString?.() ?? null,
           status: systemStatus?.formProcessStatus ?? 'unknown',

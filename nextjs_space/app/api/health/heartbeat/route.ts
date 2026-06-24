@@ -6,7 +6,7 @@ import { prisma } from '@/lib/prisma';
 /**
  * POST /api/health/heartbeat
  * Called by daemon scripts to report their status.
- * Body: { daemon: 'watch_renew' | 'form_process', status: 'ok' | 'error', message?: string }
+ * Body: { daemon: 'form_process', status: 'ok' | 'error', message?: string }
  * Auth: Bearer token from env HEARTBEAT_TOKEN (shared secret)
  */
 export async function POST(req: NextRequest) {
@@ -21,7 +21,7 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const { daemon, status, message } = body;
 
-    if (!daemon || !['watch_renew', 'form_process'].includes(daemon)) {
+    if (!daemon || !['form_process'].includes(daemon)) {
       return NextResponse.json({ error: 'Invalid daemon name' }, { status: 400 });
     }
 
@@ -30,12 +30,10 @@ export async function POST(req: NextRequest) {
 
     const updateData: Record<string, any> = {};
 
-    if (daemon === 'watch_renew') {
-      updateData.lastWatchRenewRun = now;
-      updateData.watchRenewStatus = status || 'ok';
-    } else if (daemon === 'form_process') {
+    if (daemon === 'form_process') {
       updateData.lastFormProcessRun = now;
       updateData.formProcessStatus = status || 'ok';
+      updateData.lastCloudflareEmail = now;
     }
 
     if (systemStatus) {
@@ -72,43 +70,25 @@ export async function GET(req: NextRequest) {
     }
 
     const now = Date.now();
-    const WATCH_STALE_MS = 3 * 24 * 60 * 60 * 1000; // 3 days (runs every 2 days)
-
-    const watchAge = systemStatus.lastWatchRenewRun ? now - systemStatus.lastWatchRenewRun.getTime() : null;
     const formAge = systemStatus.lastFormProcessRun ? now - systemStatus.lastFormProcessRun.getTime() : null;
 
-    const watchStale = watchAge === null || watchAge > WATCH_STALE_MS;
-
     const daemons = {
-      watchRenewal: {
-        lastRun: systemStatus.lastWatchRenewRun?.toISOString() ?? null,
-        status: systemStatus.watchRenewStatus,
-        stale: watchStale,
-        ageMinutes: watchAge !== null ? Math.round(watchAge / 60000) : null,
-        expectedIntervalMinutes: 2 * 24 * 60,
-      },
       formProcessor: {
         lastRun: systemStatus.lastFormProcessRun?.toISOString() ?? null,
         status: systemStatus.formProcessStatus,
-        stale: false, // event-driven, can't determine staleness easily
+        stale: false, // event-driven
         ageMinutes: formAge !== null ? Math.round(formAge / 60000) : null,
         expectedIntervalMinutes: null, // event-driven
       },
     };
 
-    const healthy = !watchStale;
-    const staleServices = [
-      ...(watchStale ? ['Watch Renewal'] : []),
-    ];
+    const healthy = systemStatus.formProcessStatus !== 'error';
 
     return NextResponse.json({
       healthy,
-      staleServices,
+      emailSource: systemStatus.emailSource ?? 'cloudflare',
       daemons,
-      gmailWatch: {
-        active: systemStatus.gmailWatchActive,
-        expiration: systemStatus.watchExpiration?.toISOString() ?? null,
-      },
+      lastCloudflareEmail: systemStatus.lastCloudflareEmail?.toISOString() ?? null,
     });
   } catch (error: any) {
     console.error('Health check error:', error);

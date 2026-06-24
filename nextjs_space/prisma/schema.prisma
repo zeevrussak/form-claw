@@ -138,6 +138,9 @@ model SystemStatus {
   // Alert deduplication
   lastAlertHash       String?
   lastAlertSentAt     DateTime?
+  // Email architecture
+  emailSource         String   @default("cloudflare")
+  lastCloudflareEmail DateTime?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
