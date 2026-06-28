@@ -6,16 +6,58 @@ import { createHash } from 'crypto';
 
 /**
  * GET /api/health/check
- * Checks daemon health and sends email alerts if any daemon is stale.
- * Deduplicates alerts — won't re-send if the same issues persist unchanged.
- * Called periodically by a scheduled task or externally.
+ *
+ * Primary health alerter for the CURRENT architecture
+ * (Cloudflare Email -> Webhook -> Fill -> Resend).
+ *
+ * Checks performed:
+ *   1. Form Processor error state            -> CRITICAL (alert)
+ *   2. Form Processor staleness (advisory)   -> reported, not alerted
+ *   3. Webhook intake disabled               -> CRITICAL (alert)
+ *   4. Resend outbound API key validity      -> CRITICAL (alert)
+ *   5. High processing failure rate (24h)    -> CRITICAL (alert)
+ *   6. New security-filter blocks (24h)      -> ALERT (owner wants to know)
+ *   7. Cloudflare intake staleness           -> advisory, dashboard only
+ *
+ * Sends a single deduplicated email (hash of the alert set) so the same
+ * issue is not emailed repeatedly. Clears the hash when healthy again.
+ *
  * Auth: Bearer HEARTBEAT_TOKEN
  */
+
+const FAILURE_STATUSES = ['failed', 'failure', 'error'];
+const SUCCESS_STATUSES = ['success', 'completed'];
+const BLOCKED_STATUSES = ['blocked', 'rejected'];
+const SECURITY_HINTS = ['security', 'injection', 'prompt', 'blocked'];
+
+async function validateResendKey(): Promise<{ ok: boolean; reason?: string }> {
+  const key = process.env.RESEND_API_KEY;
+  if (!key) return { ok: false, reason: 'RESEND_API_KEY not set' };
+  try {
+    // POST /emails with empty body: Resend checks auth before payload.
+    //   401 / "API key is invalid" -> bad key;  422 missing-field -> key valid.
+    // No email is sent because required fields are absent.
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    let msg = '';
+    try { msg = ((await r.json())?.message || '').toLowerCase(); } catch { /* ignore */ }
+    if (r.status === 401 || msg.includes('api key is invalid')) {
+      return { ok: false, reason: 'Resend API key is invalid' };
+    }
+    if (r.status === 403) return { ok: false, reason: 'Resend key forbidden (403)' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, reason: `Resend unreachable: ${e?.message ?? e}` };
+  }
+}
+
 export async function GET(req: NextRequest) {
   try {
     const authHeader = req.headers.get('authorization');
     const expectedToken = process.env.HEARTBEAT_TOKEN;
-
     if (!expectedToken || !authHeader || authHeader !== `Bearer ${expectedToken}`) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
@@ -26,37 +68,96 @@ export async function GET(req: NextRequest) {
     }
 
     const now = Date.now();
-    const FORM_PROC_STALE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days — form processor is event-driven, only alert if truly stale
+    const DAY = 24 * 60 * 60 * 1000;
+    const FORM_PROC_STALE_MS = 14 * DAY;   // advisory only
+    const CLOUDFLARE_STALE_MS = 14 * DAY;  // advisory only
+    const ERROR_RATE_THRESHOLD = 0.5;
+    const ERROR_RATE_MIN_VOLUME = 3;
 
+    const alerts: string[] = [];      // trigger email
+    const advisories: string[] = [];  // reported only, no email
+    const fpParts: string[] = [];     // fingerprint components (digit-stripped/stable)
+
+    // 1 + 2. Form Processor
     const formAge = systemStatus.lastFormProcessRun ? now - systemStatus.lastFormProcessRun.getTime() : null;
-    const formError = systemStatus.formProcessStatus === 'error';
+    if (systemStatus.formProcessStatus === 'error') {
+      alerts.push('Form Processor reported ERROR status');
+      fpParts.push('form_error');
+    }
+    if (formAge !== null && formAge > FORM_PROC_STALE_MS) {
+      advisories.push(`Form Processor idle ${Math.round(formAge / DAY)}d`);
+    }
 
-    const alerts: string[] = [];
-    if (formError) alerts.push('Form Processor reported ERROR status');
-    if (formAge !== null && formAge > FORM_PROC_STALE_MS) alerts.push(`Form Processor hasn\'t run in ${Math.round(formAge / 86400000)}d`);
+    // 3. Webhook intake disabled
+    if (!systemStatus.webhookEnabled) {
+      alerts.push('Webhook intake is DISABLED \u2014 no forms will be processed');
+      fpParts.push('webhook_off');
+    }
 
+    // 4. Resend outbound validity
+    const resend = await validateResendKey();
+    if (!resend.ok) {
+      alerts.push(`Resend outbound issue: ${resend.reason}`);
+      fpParts.push('resend_bad');
+    }
+
+    // 5 + 6. Processing failure rate & security blocks over last 24h
+    let failureRateInfo: any = null;
+    let securityBlockCount = 0;
+    try {
+      const since = new Date(now - DAY);
+      const recent = await prisma.formProcessingLog.findMany({
+        where: { created_at: { gte: since } },
+        select: { processing_status: true, error_type: true, error_message: true },
+      });
+      const total = recent.length;
+      const failures = recent.filter(r => FAILURE_STATUSES.includes((r.processing_status || '').toLowerCase())).length;
+      const successes = recent.filter(r => SUCCESS_STATUSES.includes((r.processing_status || '').toLowerCase())).length;
+      failureRateInfo = { total, failures, successes };
+
+      if (total >= ERROR_RATE_MIN_VOLUME && failures / total >= ERROR_RATE_THRESHOLD) {
+        alerts.push(`High failure rate: ${failures}/${total} (${Math.round((failures / total) * 100)}%) in 24h`);
+        fpParts.push('high_error_rate');
+      }
+
+      securityBlockCount = recent.filter(r => {
+        const st = (r.processing_status || '').toLowerCase();
+        const et = (r.error_type || '').toLowerCase();
+        const em = (r.error_message || '').toLowerCase();
+        return BLOCKED_STATUSES.includes(st) || SECURITY_HINTS.some(h => et.includes(h) || em.includes(h));
+      }).length;
+      if (securityBlockCount > 0) {
+        alerts.push(`${securityBlockCount} email(s) blocked by the security filter in 24h`);
+        // include count so a NEW block re-alerts
+        fpParts.push(`security_blocks_${securityBlockCount}`);
+      }
+    } catch (e) {
+      console.error('failure-rate/security query failed:', e);
+    }
+
+    // 7. Cloudflare intake staleness (advisory only)
+    const cfAge = systemStatus.lastCloudflareEmail ? now - systemStatus.lastCloudflareEmail.getTime() : null;
+    if (systemStatus.webhookEnabled && cfAge !== null && cfAge > CLOUDFLARE_STALE_MS) {
+      advisories.push(`No inbound email via Cloudflare in ${Math.round(cfAge / DAY)}d`);
+    }
+
+    // ---- Alerting (deduplicated) ----
     if (alerts.length > 0) {
-      // Create a fingerprint of the current alert set (ignoring volatile age values)
       const alertFingerprint = createHash('sha256')
-        .update([
-          formError ? 'form_error' : '',
-          (formAge !== null && formAge > FORM_PROC_STALE_MS) ? 'form_stale' : '',
-        ].filter(Boolean).sort().join('|'))
+        .update(fpParts.filter(Boolean).sort().join('|'))
         .digest('hex')
         .slice(0, 16);
 
       const alreadySent = systemStatus.lastAlertHash === alertFingerprint;
 
       if (!alreadySent) {
-        // New or changed alert — send email
         try {
           const appUrl = process.env.NEXTAUTH_URL || 'https://form-claw.abacusai.app';
           const appName = 'Form Claw';
-
           const htmlBody = `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
               <h2 style="color: #dc2626; border-bottom: 2px solid #dc2626; padding-bottom: 10px;">
-                ⚠️ Daemon Health Alert
+                \u26a0\ufe0f Form Claw Health Alert
               </h2>
               <div style="background: #fef2f2; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #dc2626;">
                 <p style="margin: 0 0 10px 0; font-weight: bold;">The following issues were detected:</p>
@@ -64,12 +165,17 @@ export async function GET(req: NextRequest) {
                   ${alerts.map(a => `<li style="margin: 5px 0; color: #991b1b;">${a}</li>`).join('')}
                 </ul>
               </div>
+              ${advisories.length ? `<div style="background: #fffbeb; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #d97706;">
+                <p style="margin: 0 0 8px 0; font-weight: bold; color:#92400e;">Advisories (informational):</p>
+                <ul style="margin: 0; padding-left: 20px;">${advisories.map(a => `<li style="margin: 4px 0; color:#92400e;">${a}</li>`).join('')}</ul>
+              </div>` : ''}
               <div style="background: #f9fafb; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                <p style="margin: 5px 0; font-size: 14px;"><strong>Email Source:</strong> ${systemStatus.emailSource ?? 'cloudflare'}</p>
-                <p style="margin: 5px 0; font-size: 14px;"><strong>Form Processor:</strong> ${systemStatus.formProcessStatus} | Last: ${systemStatus.lastFormProcessRun?.toISOString() ?? 'Never'}</p>
+                <p style="margin: 5px 0; font-size: 14px;"><strong>Email Intake:</strong> ${systemStatus.emailSource ?? 'cloudflare'} | Last inbound: ${systemStatus.lastCloudflareEmail?.toISOString() ?? 'Never'}</p>
+                <p style="margin: 5px 0; font-size: 14px;"><strong>Form Processor:</strong> ${systemStatus.formProcessStatus} | Last run: ${systemStatus.lastFormProcessRun?.toISOString() ?? 'Never'}</p>
+                ${failureRateInfo ? `<p style="margin: 5px 0; font-size: 14px;"><strong>Last 24h:</strong> ${failureRateInfo.total} received, ${failureRateInfo.successes} ok, ${failureRateInfo.failures} failed</p>` : ''}
               </div>
               <p style="color: #666; font-size: 12px;">Check time: ${new Date().toISOString()}</p>
-              <p style="margin-top: 15px;"><a href="${appUrl}/system" style="color: #2563eb;">View System Status →</a></p>
+              <p style="margin-top: 15px;"><a href="${appUrl}/system" style="color: #2563eb;">View System Status \u2192</a></p>
             </div>
           `;
 
@@ -80,7 +186,7 @@ export async function GET(req: NextRequest) {
               deployment_token: process.env.ABACUSAI_API_KEY,
               app_id: process.env.WEB_APP_ID,
               notification_id: process.env.NOTIF_ID_DAEMON_HEALTH_ALERT,
-              subject: `⚠️ Form Claw: ${alerts.length} daemon alert(s)`,
+              subject: `\u26a0\ufe0f Form Claw: ${alerts.length} health alert(s)`,
               body: htmlBody,
               is_html: true,
               recipient_email: '2396119@gmail.com',
@@ -89,18 +195,16 @@ export async function GET(req: NextRequest) {
             }),
           });
 
-          // Record the fingerprint so we don't re-send for the same issue
           await prisma.systemStatus.update({
             where: { id: systemStatus.id },
             data: { lastAlertHash: alertFingerprint, lastAlertSentAt: new Date() },
           });
         } catch (emailErr) {
-          console.error('Failed to send daemon alert email:', emailErr);
+          console.error('Failed to send health alert email:', emailErr);
         }
       }
-      // else: same alerts as before, skip email
     } else {
-      // Everything healthy — clear the alert hash so a future issue triggers a fresh email
+      // Healthy -> clear the hash so a future issue triggers a fresh email
       if (systemStatus.lastAlertHash) {
         await prisma.systemStatus.update({
           where: { id: systemStatus.id },
@@ -112,6 +216,15 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({
       healthy: alerts.length === 0,
       alerts,
+      advisories,
+      checks: {
+        formProcessStatus: systemStatus.formProcessStatus,
+        webhookEnabled: systemStatus.webhookEnabled,
+        resendOk: resend.ok,
+        last24h: failureRateInfo,
+        securityBlocks24h: securityBlockCount,
+        lastCloudflareEmail: systemStatus.lastCloudflareEmail,
+      },
       checkedAt: new Date().toISOString(),
     });
   } catch (error: any) {
