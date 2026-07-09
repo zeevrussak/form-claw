@@ -468,6 +468,85 @@ const response = await fetch('https://api.x.ai/v1/chat/completions', {
 - Hebrew OCR quality may vary vs GPT-4o
 - Grok vision is newer, less battle-tested for precise coordinate extraction
 
+### Option D: Google AI Studio Free Tier (zero-cost hosted)
+
+**Endpoint**: `https://generativelanguage.googleapis.com/v1beta/openai/` (OpenAI-compatible)  
+**Key**: Get free from [aistudio.google.com](https://aistudio.google.com/apikey)  
+**Models**: `gemini-2.5-flash` (recommended), `gemini-2.5-pro`  
+**Vision**: ✅ Native multimodal — images, PDFs, same context window as paid  
+**Hebrew**: ✅ Excellent (same Gemini models used in paid tier)  
+**Cost**: **$0 — no credit card required, no expiry**  
+
+#### Free Tier Limits (per project)
+
+| Model | RPM | RPD | TPM | Notes |
+|-------|-----|-----|-----|-------|
+| **Gemini 2.5 Flash** | 10 | 1,500 | 250K | Best for form processing |
+| **Gemini 2.5 Pro** | 5 | 50 | 250K | Overkill for forms, tight daily limit |
+
+#### Will it work for Form Claw?
+
+**Yes, comfortably.** Here's the math:
+
+```
+Per form: ~4-6 LLM calls (vision analysis + code generation + possible retry)
+Per day:  2 forms × 6 calls = 12 calls/day
+Free cap: 1,500 calls/day (Gemini 2.5 Flash)
+Usage:    0.8% of daily limit — massive headroom
+```
+
+Even at 10× the expected load (20 forms/day), you'd only use 8% of the free quota.
+
+#### Caveats
+
+| Concern | Impact | Mitigation |
+|---------|--------|------------|
+| **Data privacy** | Free tier inputs may be used to improve Google's models | Forms contain personal/medical data — evaluate your comfort level |
+| **No SLA** | Google can throttle or revoke free access anytime | Keep ChatLLM or vLLM as fallback |
+| **10 RPM cap** | Can't burst more than 10 requests/minute | Irrelevant at 2 forms/day; add exponential backoff just in case |
+| **50 RPD for Pro** | If you want Pro-level reasoning, only 50/day | Flash is sufficient for form analysis |
+
+#### Integration from Cloudflare Worker
+
+Since Google AI Studio exposes an **OpenAI-compatible endpoint**, the integration is a drop-in replacement — same code structure as Options A/B:
+
+```typescript
+const response = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${env.GOOGLE_AI_STUDIO_KEY}`,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    model: 'gemini-2.5-flash',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Analyze this PDF form...' },
+          { type: 'image_url', image_url: { url: `data:image/png;base64,${pageImageBase64}` } }
+        ]
+      }
+    ]
+  })
+});
+```
+
+#### Getting the API Key (30 seconds)
+
+1. Go to [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+2. Sign in with any Google account
+3. Click "Create API Key" → select or create a Google Cloud project
+4. Copy the key → store as `GOOGLE_AI_STUDIO_KEY` in Cloudflare Worker secrets
+
+No billing account needed. No credit card. No expiry.
+
+#### Verdict
+
+**Best "set and forget" option** — $0/month, no billing surprises, no infrastructure to maintain. The only real consideration is whether you're comfortable sending family/medical form data through Google's free tier (which may be used for model training). If privacy is a concern, pair it with your local vLLM as primary and use Google AI Studio only as a fallback for non-sensitive forms, or use the paid tier ($0 for your volume anyway — paid tier just adds data privacy guarantee).
+
+---
+
 ### Option C: Self-Hosted LLM via vLLM (your dedicated LLM machine)
 
 You already have a dedicated machine running **vLLM** with an OpenAI-compatible API. This is the primary LLM provider — zero API costs, zero external dependencies, already operational.
@@ -587,7 +666,7 @@ The Worker tries the self-hosted LLM first. If it's unreachable or returns an er
 
 ```typescript
 // src/llm.ts
-type LLMProvider = 'chatllm' | 'grok' | 'selfhosted';
+type LLMProvider = 'chatllm' | 'grok' | 'google' | 'selfhosted';
 
 interface LLMConfig {
   url: string;
@@ -614,6 +693,12 @@ function getProviderConfig(provider: LLMProvider, env: Env): LLMConfig {
         url: 'https://api.x.ai/v1/chat/completions',
         headers: { 'Authorization': `Bearer ${env.LLM_API_KEY}` },
         model: 'grok-2-vision-1212'
+      };
+    case 'google':
+      return {
+        url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+        headers: { 'Authorization': `Bearer ${env.LLM_API_KEY}` },
+        model: 'gemini-2.5-flash'
       };
   }
 }
@@ -658,7 +743,7 @@ The `provider` field in the return value gets logged to D1, so you can track how
 
 Configure in wrangler.toml `[vars]`:
 - `LLM_PROVIDER = "selfhosted"` — primary (tried first)
-- `LLM_FALLBACK_PROVIDER = "chatllm"` — cloud fallback (or `"grok"`)
+- `LLM_FALLBACK_PROVIDER = "google"` — cloud fallback (or `"chatllm"`, `"grok"`)
 
 ---
 
@@ -946,7 +1031,7 @@ WHITELISTED_SENDERS = "k6622024@gmail.com,2396119@gmail.com"
 | Secret Name | Purpose | Source |
 |------------|---------|--------|
 | `RESEND_API_KEY` | Send reply emails | Resend dashboard |
-| `LLM_API_KEY` | LLM API authentication | See Option A or B below |
+| `LLM_API_KEY` | LLM API authentication | See Option A, B, or D |
 | `PDF_SERVICE_TOKEN` | Auth for home VM Python API | Self-generated (e.g., `openssl rand -hex 32`) |
 | `HEARTBEAT_TOKEN` | Dashboard health reporting | Existing value |
 
@@ -956,7 +1041,7 @@ WHITELISTED_SENDERS = "k6622024@gmail.com,2396119@gmail.com"
 |----------|-------|
 | `PDF_SERVICE_URL` | `https://pdf.savlil.com` |
 | `DASHBOARD_URL` | `https://formclaw.savlil.com` |
-| `LLM_PROVIDER` | `selfhosted`, `chatllm`, or `grok` |
+| `LLM_PROVIDER` | `selfhosted`, `chatllm`, `grok`, or `google` |
 | `LLM_API_URL` | `https://llm.savlil.com/v1/chat/completions` (for self-hosted) |
 | `LLM_MODEL` | `gemma4:12b` (or `qwen2.5-vl:7b`, etc.) |
 | `LLM_FALLBACK_PROVIDER` | `chatllm` (used if primary is down) |
@@ -1031,20 +1116,20 @@ Estimated tokens per form: ~5,000 input + ~3,500 output (single page form)
 
 ### Monthly cost at 2 forms/day (60 forms/month)
 
-| Component | Option A: ChatLLM | Option B: Grok (xAI) | Option C: Self-Hosted LLM |
-|-----------|-------------------|----------------------|---------------------------|
-| **LLM API** | Included in Abacus sub | ~$2.70/mo | $0 (your hardware) |
-| **Cloudflare Workers** | Free tier | Free tier | Free tier |
-| **Cloudflare D1** | Free tier (5GB) | Free tier | Free tier |
-| **Cloudflare R2** | Free tier (10GB) | Free tier | Free tier |
-| **Cloudflare Email Routing** | Free | Free | Free |
-| **Resend API** | Free tier | Free tier | Free tier |
-| **Home VM (PDF + Dashboard)** | $0 (your HW) | $0 (your HW) | $0 (your HW) |
-| **Home VM (Ollama + GPU)** | — | — | ~$3-8/mo electricity |
-| **GitHub** | Free | Free | Free |
-| | | | |
-| **Total monthly** | **~$0/mo** | **~$3/mo** | **~$3-8/mo** (electricity only) |
-| **Total one-time** | $0 | $0 | $0–$400 (GPU if buying new) |
+| Component | Option A: ChatLLM | Option B: Grok (xAI) | Option C: Self-Hosted vLLM | Option D: Google AI Studio |
+|-----------|-------------------|----------------------|---------------------------|----------------------------|
+| **LLM API** | Included in Abacus sub | ~$2.70/mo | $0 (your hardware) | **$0 (free tier)** |
+| **Cloudflare Workers** | Free tier | Free tier | Free tier | Free tier |
+| **Cloudflare D1** | Free tier (5GB) | Free tier | Free tier | Free tier |
+| **Cloudflare R2** | Free tier (10GB) | Free tier | Free tier | Free tier |
+| **Cloudflare Email Routing** | Free | Free | Free | Free |
+| **Resend API** | Free tier | Free tier | Free tier | Free tier |
+| **Home VM (PDF + Dashboard)** | $0 (your HW) | $0 (your HW) | $0 (your HW) | $0 (your HW) |
+| **Home LLM machine** | — | — | ~$3-8/mo electricity | — |
+| **GitHub** | Free | Free | Free | Free |
+| | | | | |
+| **Total monthly** | **~$0/mo** | **~$3/mo** | **~$3-8/mo** (electricity) | **~$0/mo** |
+| **Total one-time** | $0 | $0 | $0 (already have HW) | $0 |
 
 ### Token math for Grok
 
@@ -1136,7 +1221,7 @@ Monthly (60 forms): 60 × $0.045 = $2.70
 
 | Question | Recommended Choice |
 |----------|--------------------|
-| LLM Provider | **Self-hosted Gemma 4 12B** (free, private). Fall back to **ChatLLM** or **Grok** if quality issues. |
+| LLM Provider | **Self-hosted vLLM** (free, private) primary. **Google AI Studio** (free, zero-infra) as best fallback. ChatLLM or Grok as additional options. |
 | PDF Processing | **Self-hosted Python API on Proxmox VM** via Cloudflare Tunnel |
 | Database | **Cloudflare D1** (SQLite, free tier, native to Workers) |
 | Storage (assets) | **Local disk on home VM** (signatures, fonts, model weights) |
