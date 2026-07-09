@@ -58,7 +58,7 @@ This means the migration is NOT about porting a fixed codebase — it's about:
 
 ---
 
-## 2. Target Architecture (Cloudflare + self-hosted VM)
+## 2. Target Architecture (Cloudflare + self-hosted Proxmox)
 
 ```
 ┌─────────────────┐    ┌──────────────────────────────────────────────┐
@@ -70,45 +70,54 @@ This means the migration is NOT about porting a fixed codebase — it's about:
                        ┌──────────────────────────────────────────────▼─┐
                        │ Cloudflare Worker: form-claw-processor         │
                        │                                                │
-                       │  1. Receive webhook JSON (from, subject,       │
-                       │     attachments[].contentBase64)                │
-                       │  2. Security filter (port scan_email_content)  │
-                       │  3. Call LLM vision API to analyze PDF pages   │
-                       │  4. Call LLM to generate fill instructions     │
-                       │  5. Call home VM Python API to execute fill    │
-                       │     (ReportLab + PyPDF2 + signature overlay)   │
+                       │  1. Receive webhook JSON                       │
+                       │  2. Security filter                            │
+                       │  3-4. LLM vision (local → cloud fallback)      │
+                       │  5. Call home LXC Python API to fill PDF       │
                        │  6. Send filled PDF via Resend API             │
                        │  7. Log to Cloudflare D1                       │
                        └───────────────────────────────────────────────┘
+                                         │
+┌──────────────────────┐          │
+│ Cloudflare D1        │          │
+│ (SQLite at edge)     │          │
+└──────────────────────┘          │
+                                  │   Cloudflare Tunnel
+══════════════════════════════════════════════════════════════════════
+ HOME PROXMOX HOST
+══════════════════════════════════════════════════════════════════════
 
-┌──────────────────────┐    ┌──────────────────────┐
-│ Cloudflare D1        │    │ Dashboard            │
-│ (SQLite at edge)     │    │ (stays on Abacus OR  │
-│ - form processing    │    │  moves to Cloudflare │
-│   logs               │    │  Pages — your call)  │
-│ - system_status      │    └──────────────────────┘
-│ - knowledge_entries  │
-│ - app_config         │
-└──────────────────────┘
+ ┌───────────────────────────────────────────────────────────────┐
+ │ LXC: form-claw-services  (Ubuntu 24.04)                  │
+ │                                                           │
+ │  :3000  Next.js Dashboard  → formclaw.savlil.com          │
+ │  :8787  FastAPI PDF Filler → pdf.savlil.com               │
+ │                                                           │
+ │  RAM: 2–4 GB  |  CPU: 2–4 cores  |  Disk: 10 GB           │
+ │  Assets: signatures/, fonts/, family_data.json            │
+ │  cloudflared tunnel running as systemd service            │
+ └───────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────┐
-│ HOME PROXMOX VM  (fixed IP, reverse-proxied via Cloudflare │
-│                   Tunnel or direct with DDNS)               │
-│                                                             │
-│  ┌─────────────────────────────────────────┐                │
-│  │ Python API (FastAPI / Flask)            │                │
-│  │  POST /fill-pdf                         │                │
-│  │  • ReportLab, PyPDF2, Pillow            │                │
-│  │  • Signatures & fonts on local disk     │                │
-│  │  • Token-authenticated                  │                │
-│  └─────────────────────────────────────────┘                │
-│                                                             │
-│  Assets: signatures/, fonts/, family_data.json              │
-│  OS: Debian/Ubuntu LXC or VM (lightweight)                  │
-│  RAM: 512MB–1GB sufficient                                  │
-│  Disk: <1GB                                                 │
-└─────────────────────────────────────────────────────────────┘
+ ┌───────────────────────────────────────────────────────────────┐
+ │ DEDICATED LLM MACHINE  (already running, separate host)   │
+ │                                                           │
+ │  vLLM server (OpenAI-compatible API)                      │
+ │  :8000  /v1/chat/completions                              │
+ │  Model: Gemma 4 / Qwen2.5-VL / etc.                      │
+ │  Reachable from LXC on LAN or via Cloudflare Tunnel       │
+ └───────────────────────────────────────────────────────────────┘
 ```
+
+### LXC vs VM: What Goes Where
+
+| Service | Where | Why |
+|---------|-------|-----|
+| **FastAPI PDF Filler** | ✅ LXC | Pure Python, no hardware access needed. Lowest overhead. |
+| **Next.js Dashboard** | ✅ LXC | Node.js process, no special kernel features. |
+| **Cloudflare Tunnel** | ✅ LXC | Userspace binary, works everywhere. |
+| **vLLM (self-hosted LLM)** | ✅ **Existing dedicated machine** | Already running — no changes needed, reachable on LAN. |
+
+**Recommendation**: Run PDF filler + dashboard + cloudflared in a **single LXC container** (2–4 vCPU, 2–4 GB RAM, 10 GB disk). The LLM stays on your existing dedicated machine — the Cloudflare Worker (or the LXC services) calls it over your LAN or via Tunnel.
 
 ---
 
@@ -240,17 +249,9 @@ Run the Next.js dashboard on the same Proxmox host as the PDF filler, exposed vi
 - Direct access to D1 via HTTP API (or local SQLite replica)
 - Cloudflare Tunnel = free TLS, no port forwarding
 
-#### Dashboard VM / LXC Requirements
+#### Dashboard runs in the same LXC
 
-| Requirement | Minimum | Recommended |
-|-------------|---------|-------------|
-| **OS** | Debian 12 / Ubuntu 22.04 | Ubuntu 24.04 LXC |
-| **CPU** | 1 vCPU | 2 vCPU |
-| **RAM** | 512 MB | 1 GB (Next.js build + runtime) |
-| **Disk** | 2 GB | 5 GB (Node.js + app + .next cache) |
-| **Node.js** | 18 LTS | 20 LTS |
-
-> **Tip**: Can share the same LXC as the PDF filler if you prefer — just run both services on different ports (8787 for PDF API, 3000 for dashboard).
+No separate container needed — the dashboard runs alongside the PDF filler in the same LXC (port 3000 for dashboard, port 8787 for PDF API). Node.js 20 is already installed for the dashboard.
 
 #### Database Strategy
 
@@ -467,9 +468,9 @@ const response = await fetch('https://api.x.ai/v1/chat/completions', {
 - Hebrew OCR quality may vary vs GPT-4o
 - Grok vision is newer, less battle-tested for precise coordinate extraction
 
-### Option C: Self-Hosted LLM (Gemma 4 / Qwen2.5-VL / etc.)
+### Option C: Self-Hosted LLM via vLLM (your dedicated LLM machine)
 
-Run a vision-capable open model on your Proxmox server via **Ollama** or **vLLM**. This is the fully self-sufficient option — zero API costs, zero external dependencies.
+You already have a dedicated machine running **vLLM** with an OpenAI-compatible API. This is the primary LLM provider — zero API costs, zero external dependencies, already operational.
 
 #### Recommended Models
 
@@ -482,46 +483,36 @@ Run a vision-capable open model on your Proxmox server via **Ollama** or **vLLM*
 | **Qwen2.5-VL-72B** | 72B | ~42 GB | ✅ Best-in-class OCR | ✅ Good | Apache 2.0 | Enterprise quality but needs serious hardware |
 | **Phi-4 Reasoning Vision** | 14B | ~8 GB | ✅ Good | ⚠️ Limited | MIT | Strong reasoning, smaller footprint |
 
-#### Hardware Requirements for Proxmox VM
+#### Model Selection Guide
 
-| Model Tier | GPU | VRAM | RAM | Disk | Notes |
-|------------|-----|------|-----|------|-------|
-| **Budget** (Gemma 4 12B / Qwen 7B) | 1× RTX 3060 12GB or RTX 4060 Ti 16GB | 12–16 GB | 16 GB | 30 GB | Good enough for 1-2 forms/day |
-| **Mid** (Gemma 4 27B) | 1× RTX 3090 / 4090 | 24 GB | 32 GB | 50 GB | Best quality/cost for self-hosted |
-| **High** (Qwen 72B) | 2× RTX 3090 or 1× A100 | 48+ GB | 64 GB | 100 GB | Enterprise quality, overkill for 2/day |
-| **CPU-only** (Gemma 4 12B Q4) | None | 0 | 16 GB | 30 GB | Works but slow (~2-5 tok/s, ~60s per form analysis) |
+Pick the right model for your dedicated vLLM machine based on its GPU:
 
-> **Recommendation for your use case (2 forms/day)**: **Gemma 4 12B** on a GPU with 12+ GB VRAM, or **CPU-only** if you can tolerate ~60 seconds per form analysis. For Hebrew-heavy forms, **Qwen2.5-VL-7B** may have better Hebrew OCR out of the box.
+| Model | VRAM needed (Q4) | Vision Quality | Hebrew Quality | Notes |
+|-------|-----------------|----------------|----------------|-------|
+| **Gemma 4 12B** | ~8 GB | ✅ Good | ⚠️ Moderate | Best speed/quality ratio |
+| **Gemma 4 27B** | ~18 GB | ✅ Excellent + bounding boxes | ⚠️ Moderate | Best open model for doc analysis |
+| **Qwen2.5-VL-7B** | ~5 GB | ✅ Excellent OCR | ✅ Good | Best Hebrew OCR among smaller models |
+| **Qwen2.5-VL-72B** | ~42 GB | ✅ Best-in-class | ✅ Good | If your machine has the VRAM |
 
-#### Setup via Ollama (simplest)
+> **Recommendation for Hebrew forms**: Start with **Qwen2.5-VL-7B** (best Hebrew OCR in its class). If your machine has 24+ GB VRAM, try **Gemma 4 27B** for superior document analysis.
+
+#### vLLM Setup (already running)
+
+Your dedicated LLM machine already runs vLLM. Ensure it's configured with a vision-capable model and the OpenAI-compatible API enabled:
 
 ```bash
-# On the Proxmox VM (same one or a dedicated GPU-passthrough VM)
+# vLLM serves an OpenAI-compatible API (default port 8000)
+# Typical startup command:
+vllm serve google/gemma-4-12b-it \  # or Qwen/Qwen2.5-VL-7B-Instruct
+  --port 8000 \
+  --api-key "your-token"  # optional, for auth
 
-# 1. Install Ollama
-curl -fsSL https://ollama.com/install.sh | sh
-
-# 2. Pull your chosen model
-ollama pull gemma4:12b          # ~7GB download, 8GB VRAM
-# OR
-ollama pull gemma4:27b          # ~18GB download, 24GB VRAM  
-# OR
-ollama pull qwen2.5-vl:7b       # ~5GB download, good Hebrew OCR
-
-# 3. Ollama serves an OpenAI-compatible API on port 11434
-# Test it:
-curl http://localhost:11434/v1/chat/completions \
+# Verify vision works:
+curl http://<LLM_MACHINE_IP>:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-token" \
   -d '{
-    "model": "gemma4:12b",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-
-# 4. For vision (send base64 image):
-curl http://localhost:11434/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemma4:12b",
+    "model": "google/gemma-4-12b-it",
     "messages": [{
       "role": "user",
       "content": [
@@ -530,71 +521,54 @@ curl http://localhost:11434/v1/chat/completions \
       ]
     }]
   }'
-
-# 5. Create systemd override for auto-start
-systemctl enable ollama
 ```
 
-#### Exposing to Cloudflare Worker
+#### Exposing vLLM to Cloudflare Worker
 
-The Cloudflare Worker needs to reach Ollama on your VM. Two approaches:
+The Cloudflare Worker needs to reach your vLLM server. Two approaches:
 
-**Approach A: Tunnel the Ollama API** (recommended)
+**Approach A: Cloudflare Tunnel** (recommended — if LLM machine has cloudflared)
 ```yaml
-# Add to /etc/cloudflared/config.yml:
+# On the LLM machine, add to cloudflared config:
 ingress:
   - hostname: llm.savlil.com
-    service: http://localhost:11434
+    service: http://localhost:8000
 ```
 Then in the Worker: `LLM_API_URL = https://llm.savlil.com/v1/chat/completions`
 
-**Approach B: Call from the PDF filler VM directly**
-Since the PDF filler and Ollama run on the same host (or LAN), the Worker calls the PDF filler, which calls Ollama locally. This avoids exposing the LLM API to the internet.
+**Approach B: Route through the LXC** (no extra tunnel needed)
+The Worker calls `pdf.savlil.com` (the LXC), and the PDF filler LXC calls vLLM over LAN (`http://<LLM_IP>:8000`). This keeps the LLM API fully private — never exposed to the internet.
+
+**Approach C: Direct tunnel from existing LXC**
+Add the LLM machine's IP as an ingress in the LXC's existing cloudflared tunnel:
+```yaml
+ingress:
+  - hostname: llm.savlil.com
+    service: http://<LLM_MACHINE_LAN_IP>:8000
+```
+This works if the LXC can reach the LLM machine on your LAN.
 
 #### Integration from Cloudflare Worker
 
 ```typescript
-// Same OpenAI-compatible format as ChatLLM and Grok:
+// Same OpenAI-compatible format as ChatLLM and Grok — vLLM is fully compatible:
 const response = await fetch(env.LLM_API_URL, {  // https://llm.savlil.com/v1/chat/completions
   method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  // No auth needed if behind Cloudflare Tunnel with Access policy
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${env.VLLM_API_KEY}`  // if vLLM requires auth
+  },
   body: JSON.stringify({
-    model: 'gemma4:12b',
+    model: env.LLM_MODEL,  // e.g. 'google/gemma-4-12b-it'
     messages: [{
       role: 'user',
       content: [
         { type: 'text', text: 'Analyze this Hebrew PDF form...' },
         { type: 'image_url', image_url: { url: `data:image/png;base64,${pageImageBase64}` } }
       ]
-    }],
-    temperature: 1.0,
-    top_p: 0.95
+    }]
   })
 });
-```
-
-#### GPU Passthrough in Proxmox
-
-If your Proxmox host has a dedicated GPU (e.g., RTX 3060/3090/4090):
-
-```bash
-# 1. Enable IOMMU in BIOS and grub:
-#    GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_iommu=on iommu=pt"
-#    (or amd_iommu=on for AMD)
-
-# 2. Blacklist host GPU drivers:
-echo "blacklist nouveau" >> /etc/modprobe.d/blacklist.conf
-echo "blacklist nvidia" >> /etc/modprobe.d/blacklist.conf
-update-initramfs -u
-
-# 3. Add PCI device to VM in Proxmox UI:
-#    VM → Hardware → Add → PCI Device → select your GPU
-#    Check: All Functions, ROM-Bar, PCI-Express
-
-# 4. Inside the VM, install NVIDIA drivers:
-apt install -y nvidia-driver-560  # or latest
-nvidia-smi  # verify GPU is visible
 ```
 
 #### Risks of Self-Hosted LLM
@@ -603,9 +577,9 @@ nvidia-smi  # verify GPU is visible
 |------|--------|------------|
 | Hebrew OCR quality lower than GPT-4o | Field misidentification | Test with 10+ real Hebrew forms before committing; fall back to ChatLLM/Grok for Hebrew-heavy forms |
 | Slower inference (~5-30s per vision call) | Longer form processing | Acceptable for 2/day; use quantized model; GPU passthrough |
-| Model updates require manual pull | Miss improvements | Cron job: `ollama pull gemma4:12b` weekly |
-| GPU hardware failure | LLM unavailable | Configure Worker to fall back to ChatLLM API if self-hosted is down |
-| Power consumption | Higher electricity | GPU idle power is ~15-30W; minimal for intermittent use |
+| Model updates require manual action | Miss improvements | Update model weights periodically; vLLM supports hot-reload with `--served-model-name` |
+| LLM machine down (maintenance, power) | LLM unavailable | Worker auto-falls back to ChatLLM/Grok; LLM machine has its own UPS |
+| Power consumption | Higher electricity | GPU idle power is ~15-30W; machine is already running for other tasks |
 
 #### LLM Cascade: Self-Hosted First, Cloud Fallback
 
@@ -626,8 +600,8 @@ function getProviderConfig(provider: LLMProvider, env: Env): LLMConfig {
     case 'selfhosted':
       return {
         url: env.LLM_API_URL,   // https://llm.savlil.com/v1/chat/completions
-        headers: {},             // no auth if behind CF Tunnel + Access
-        model: env.LLM_MODEL || 'gemma4:12b'
+        headers: env.VLLM_API_KEY ? { 'Authorization': `Bearer ${env.VLLM_API_KEY}` } : {},
+        model: env.LLM_MODEL || 'google/gemma-4-12b-it'
       };
     case 'chatllm':
       return {
@@ -702,16 +676,21 @@ The form filler needs Python with:
 
 Run a lightweight Python API on a **Proxmox LXC container or VM** at home.
 
-#### VM / LXC Requirements
+#### LXC Container Requirements
 
-| Requirement | Minimum | Recommended |
-|-------------|---------|-------------|
-| **OS** | Debian 12 / Ubuntu 22.04 (LXC or VM) | Ubuntu 24.04 LXC (lowest overhead) |
-| **CPU** | 1 vCPU | 2 vCPU (PDF rendering benefits from extra core) |
-| **RAM** | 512 MB | 1 GB (ReportLab + Pillow peak during render) |
-| **Disk** | 2 GB | 5 GB (OS + Python + deps + fonts + signatures + logs) |
-| **Network** | Fixed IP, port forwarded (443 → VM) | Cloudflare Tunnel (zero port forwarding) |
+PDF filler, dashboard, and cloudflared share a single LXC (LLM stays on your dedicated machine):
+
+| Requirement | Single service (PDF only) | All-in-one LXC (recommended) |
+|-------------|--------------------------|------------------------------|
+| **OS** | Debian 12 / Ubuntu 22.04 | Ubuntu 24.04 |
+| **CPU** | 1 vCPU | 2–4 vCPU |
+| **RAM** | 512 MB | 2 GB (Node.js + Python) |
+| **Disk** | 2 GB | 10 GB (OS + Node + Python + assets) |
+| **Network** | Cloudflare Tunnel (zero port forwarding) | Same |
 | **Python** | 3.10+ | 3.12 |
+| **Node.js** | — | 20 LTS (for dashboard) |
+
+> **LXC creation in Proxmox**: Datacenter → Create CT → Template: Ubuntu 24.04 → CPU: 2, RAM: 2048MB, Disk: 10GB → Network: DHCP or static on your LAN. Enable `nesting=1` in Options (needed for systemd services inside LXC).
 
 #### Setup Steps
 
@@ -957,7 +936,7 @@ PDF_SERVICE_URL = "https://pdf.savlil.com"
 DASHBOARD_URL = "https://formclaw.savlil.com"
 LLM_PROVIDER = "selfhosted"           # or "chatllm" or "grok"
 LLM_API_URL = "https://llm.savlil.com/v1/chat/completions"
-LLM_MODEL = "gemma4:12b"
+LLM_MODEL = "google/gemma-4-12b-it"      # or your vLLM model name
 LLM_FALLBACK_PROVIDER = "chatllm"     # auto-fallback if self-hosted is down
 WHITELISTED_SENDERS = "k6622024@gmail.com,2396119@gmail.com"
 ```
