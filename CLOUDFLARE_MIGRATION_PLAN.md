@@ -230,26 +230,138 @@ CREATE INDEX idx_log_status ON form_processing_log(processing_status);
 CREATE INDEX idx_knowledge_active ON knowledge_entry(is_active, category);
 ```
 
-### 3.4 Dashboard
+### 3.4 Dashboard — Self-Hosted on Proxmox VM (recommended)
 
-**Option A** (recommended for phase 1): Keep on Abacus  
-- Dashboard continues to work as-is, using Abacus Postgres
-- Add a D1 sync: Processor Worker writes to D1, a Cron Trigger pushes new rows to Abacus Postgres hourly
-- Zero dashboard code changes
+Run the Next.js dashboard on the same Proxmox host as the PDF filler, exposed via Cloudflare Tunnel.
 
-**Option B** (full migration): Move to Cloudflare Pages + D1  
-- Next.js on Pages has limitations (edge runtime, no native Prisma)
-- Replace Prisma with `better-sqlite3` client via D1 HTTP API or Drizzle ORM with D1 driver
-- Auth: Cloudflare Access (free for ≤50 users) replaces NextAuth + Google SSO
-- Significant rewrite but zero external dependencies
+#### Why self-host
+- Full control, no platform dependency
+- Same VM or sibling LXC — negligible extra resource cost
+- Direct access to D1 via HTTP API (or local SQLite replica)
+- Cloudflare Tunnel = free TLS, no port forwarding
 
-**Option C** (self-host dashboard on Proxmox VM too)  
-- Run the Next.js dashboard directly on the home VM
-- Use D1 HTTP API for reads or run a local SQLite replica synced from D1
-- Expose via Cloudflare Tunnel (dashboard.savlil.com → VM:3000)
-- Full control, but adds VM maintenance burden
+#### Dashboard VM / LXC Requirements
 
-**Recommendation**: Start with **Option A** (keep on Abacus), migrate to **Option C** later if desired.
+| Requirement | Minimum | Recommended |
+|-------------|---------|-------------|
+| **OS** | Debian 12 / Ubuntu 22.04 | Ubuntu 24.04 LXC |
+| **CPU** | 1 vCPU | 2 vCPU |
+| **RAM** | 512 MB | 1 GB (Next.js build + runtime) |
+| **Disk** | 2 GB | 5 GB (Node.js + app + .next cache) |
+| **Node.js** | 18 LTS | 20 LTS |
+
+> **Tip**: Can share the same LXC as the PDF filler if you prefer — just run both services on different ports (8787 for PDF API, 3000 for dashboard).
+
+#### Database Strategy
+
+The dashboard needs to read the same data the Processor Worker writes to D1. Options:
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **D1 HTTP API** (recommended) | Real-time reads, single source of truth, no sync lag | Requires Cloudflare API token, REST calls from server-side |
+| **Local SQLite replica** | Zero network latency, works offline | Need sync mechanism (Litestream or cron-based D1 export) |
+| **D1 + local write-through** | Dashboard can also write (knowledge entries, config) | More complex, but fully self-contained |
+
+**Recommended**: Use the **D1 HTTP REST API** from the dashboard's API routes. Replace Prisma calls with a thin D1 client:
+
+```typescript
+// lib/d1-client.ts
+const D1_API = `https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/d1/database/${process.env.D1_DATABASE_ID}/query`;
+
+export async function queryD1(sql: string, params: any[] = []) {
+  const res = await fetch(D1_API, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.CF_API_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ sql, params })
+  });
+  const data = await res.json();
+  return data.result[0].results;
+}
+```
+
+#### Setup Steps
+
+```bash
+# Inside the LXC (or same container as PDF filler):
+
+# 1. Install Node.js 20
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt install -y nodejs
+
+# 2. Clone repo and build
+cd /opt
+git clone https://github.com/zeevrussak/form-claw.git
+cd form-claw/nextjs_space
+
+# 3. Create .env for self-hosted mode
+cat > .env << 'EOF'
+# D1 access (replaces Prisma/Postgres)
+CF_ACCOUNT_ID=<your-cloudflare-account-id>
+D1_DATABASE_ID=<your-d1-database-id>
+CF_API_TOKEN=<cloudflare-api-token-with-d1-read-write>
+
+# Auth
+NEXTAUTH_URL=https://formclaw.savlil.com
+NEXTAUTH_SECRET=<generate-with-openssl-rand-hex-32>
+GOOGLE_CLIENT_ID=<your-google-oauth-client-id>
+GOOGLE_CLIENT_SECRET=<your-google-oauth-client-secret>
+
+# Optional: Resend key for health checks
+RESEND_API_KEY=<your-resend-key>
+EOF
+
+# 4. Install deps and build
+npm install  # or yarn
+npm run build
+
+# 5. Create systemd service
+cat > /etc/systemd/system/form-claw-dashboard.service << 'EOF'
+[Unit]
+Description=Form Claw Dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/form-claw/nextjs_space
+ExecStart=/usr/bin/node .next/standalone/server.js
+Restart=always
+RestartSec=5
+Environment=PORT=3000
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable --now form-claw-dashboard
+```
+
+#### Cloudflare Tunnel Ingress (add to existing tunnel config)
+
+```yaml
+# /etc/cloudflared/config.yml — add this ingress rule:
+ingress:
+  - hostname: formclaw.savlil.com
+    service: http://localhost:3000
+  - hostname: pdf.savlil.com
+    service: http://localhost:8787
+  - service: http_status:404
+```
+
+Result: `https://formclaw.savlil.com` serves the dashboard, `https://pdf.savlil.com` serves the PDF API — both from the same VM, same tunnel.
+
+#### Migration from Prisma to D1
+
+The current dashboard uses Prisma with PostgreSQL. For self-hosting with D1, you'll need to:
+1. Replace `prisma` imports with the D1 HTTP client in all API routes
+2. Rewrite queries from Prisma syntax to raw SQL (the D1 schema in Section 3.3 maps 1:1)
+3. Keep NextAuth — it works fine with a local SQLite file for session/user storage, or use Cloudflare Access instead
+4. The dashboard UI code (React components, charts) stays identical — only the data-fetching layer changes
+
+**Estimated effort**: 1-2 days for the Prisma → D1 migration.
 
 ### 3.5 Health Monitoring
 
@@ -354,6 +466,225 @@ const response = await fetch('https://api.x.ai/v1/chat/completions', {
 - Requires separate API key & billing
 - Hebrew OCR quality may vary vs GPT-4o
 - Grok vision is newer, less battle-tested for precise coordinate extraction
+
+### Option C: Self-Hosted LLM (Gemma 4 / Qwen2.5-VL / etc.)
+
+Run a vision-capable open model on your Proxmox server via **Ollama** or **vLLM**. This is the fully self-sufficient option — zero API costs, zero external dependencies.
+
+#### Recommended Models
+
+| Model | Size | VRAM (Q4) | Vision | Hebrew | License | Notes |
+|-------|------|-----------|--------|--------|---------|-------|
+| **Gemma 4 12B** | 12B | ~8 GB | ✅ Native (encoder-free) | ⚠️ Moderate | Apache 2.0 | Best balance of speed + quality for a single GPU |
+| **Gemma 4 27B** | 31B dense | ~18 GB | ✅ Native + bounding boxes | ⚠️ Moderate | Apache 2.0 | Best open model for document analysis; needs 24GB GPU |
+| **Gemma 4 26B MoE** | 26B (3.8B active) | ~15 GB | ✅ Native | ⚠️ Moderate | Apache 2.0 | Fast inference via sparse activation |
+| **Qwen2.5-VL-7B** | 7B | ~5 GB | ✅ Excellent OCR | ✅ Good | Apache 2.0 | Smallest viable option; strong document understanding |
+| **Qwen2.5-VL-72B** | 72B | ~42 GB | ✅ Best-in-class OCR | ✅ Good | Apache 2.0 | Enterprise quality but needs serious hardware |
+| **Phi-4 Reasoning Vision** | 14B | ~8 GB | ✅ Good | ⚠️ Limited | MIT | Strong reasoning, smaller footprint |
+
+#### Hardware Requirements for Proxmox VM
+
+| Model Tier | GPU | VRAM | RAM | Disk | Notes |
+|------------|-----|------|-----|------|-------|
+| **Budget** (Gemma 4 12B / Qwen 7B) | 1× RTX 3060 12GB or RTX 4060 Ti 16GB | 12–16 GB | 16 GB | 30 GB | Good enough for 1-2 forms/day |
+| **Mid** (Gemma 4 27B) | 1× RTX 3090 / 4090 | 24 GB | 32 GB | 50 GB | Best quality/cost for self-hosted |
+| **High** (Qwen 72B) | 2× RTX 3090 or 1× A100 | 48+ GB | 64 GB | 100 GB | Enterprise quality, overkill for 2/day |
+| **CPU-only** (Gemma 4 12B Q4) | None | 0 | 16 GB | 30 GB | Works but slow (~2-5 tok/s, ~60s per form analysis) |
+
+> **Recommendation for your use case (2 forms/day)**: **Gemma 4 12B** on a GPU with 12+ GB VRAM, or **CPU-only** if you can tolerate ~60 seconds per form analysis. For Hebrew-heavy forms, **Qwen2.5-VL-7B** may have better Hebrew OCR out of the box.
+
+#### Setup via Ollama (simplest)
+
+```bash
+# On the Proxmox VM (same one or a dedicated GPU-passthrough VM)
+
+# 1. Install Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+
+# 2. Pull your chosen model
+ollama pull gemma4:12b          # ~7GB download, 8GB VRAM
+# OR
+ollama pull gemma4:27b          # ~18GB download, 24GB VRAM  
+# OR
+ollama pull qwen2.5-vl:7b       # ~5GB download, good Hebrew OCR
+
+# 3. Ollama serves an OpenAI-compatible API on port 11434
+# Test it:
+curl http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma4:12b",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+
+# 4. For vision (send base64 image):
+curl http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma4:12b",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Analyze this PDF form..."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+      ]
+    }]
+  }'
+
+# 5. Create systemd override for auto-start
+systemctl enable ollama
+```
+
+#### Exposing to Cloudflare Worker
+
+The Cloudflare Worker needs to reach Ollama on your VM. Two approaches:
+
+**Approach A: Tunnel the Ollama API** (recommended)
+```yaml
+# Add to /etc/cloudflared/config.yml:
+ingress:
+  - hostname: llm.savlil.com
+    service: http://localhost:11434
+```
+Then in the Worker: `LLM_API_URL = https://llm.savlil.com/v1/chat/completions`
+
+**Approach B: Call from the PDF filler VM directly**
+Since the PDF filler and Ollama run on the same host (or LAN), the Worker calls the PDF filler, which calls Ollama locally. This avoids exposing the LLM API to the internet.
+
+#### Integration from Cloudflare Worker
+
+```typescript
+// Same OpenAI-compatible format as ChatLLM and Grok:
+const response = await fetch(env.LLM_API_URL, {  // https://llm.savlil.com/v1/chat/completions
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  // No auth needed if behind Cloudflare Tunnel with Access policy
+  body: JSON.stringify({
+    model: 'gemma4:12b',
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Analyze this Hebrew PDF form...' },
+        { type: 'image_url', image_url: { url: `data:image/png;base64,${pageImageBase64}` } }
+      ]
+    }],
+    temperature: 1.0,
+    top_p: 0.95
+  })
+});
+```
+
+#### GPU Passthrough in Proxmox
+
+If your Proxmox host has a dedicated GPU (e.g., RTX 3060/3090/4090):
+
+```bash
+# 1. Enable IOMMU in BIOS and grub:
+#    GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_iommu=on iommu=pt"
+#    (or amd_iommu=on for AMD)
+
+# 2. Blacklist host GPU drivers:
+echo "blacklist nouveau" >> /etc/modprobe.d/blacklist.conf
+echo "blacklist nvidia" >> /etc/modprobe.d/blacklist.conf
+update-initramfs -u
+
+# 3. Add PCI device to VM in Proxmox UI:
+#    VM → Hardware → Add → PCI Device → select your GPU
+#    Check: All Functions, ROM-Bar, PCI-Express
+
+# 4. Inside the VM, install NVIDIA drivers:
+apt install -y nvidia-driver-560  # or latest
+nvidia-smi  # verify GPU is visible
+```
+
+#### Risks of Self-Hosted LLM
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Hebrew OCR quality lower than GPT-4o | Field misidentification | Test with 10+ real Hebrew forms before committing; fall back to ChatLLM/Grok for Hebrew-heavy forms |
+| Slower inference (~5-30s per vision call) | Longer form processing | Acceptable for 2/day; use quantized model; GPU passthrough |
+| Model updates require manual pull | Miss improvements | Cron job: `ollama pull gemma4:12b` weekly |
+| GPU hardware failure | LLM unavailable | Configure Worker to fall back to ChatLLM API if self-hosted is down |
+| Power consumption | Higher electricity | GPU idle power is ~15-30W; minimal for intermittent use |
+
+#### LLM Cascade: Self-Hosted First, Cloud Fallback
+
+The Worker tries the self-hosted LLM first. If it's unreachable or returns an error, it automatically retries with the configured cloud fallback (ChatLLM or Grok):
+
+```typescript
+// src/llm.ts
+type LLMProvider = 'chatllm' | 'grok' | 'selfhosted';
+
+interface LLMConfig {
+  url: string;
+  headers: Record<string, string>;
+  model: string;
+}
+
+function getProviderConfig(provider: LLMProvider, env: Env): LLMConfig {
+  switch (provider) {
+    case 'selfhosted':
+      return {
+        url: env.LLM_API_URL,   // https://llm.savlil.com/v1/chat/completions
+        headers: {},             // no auth if behind CF Tunnel + Access
+        model: env.LLM_MODEL || 'gemma4:12b'
+      };
+    case 'chatllm':
+      return {
+        url: 'https://apps.abacus.ai/api/v0/chat/completions',
+        headers: { 'Authorization': `Bearer ${env.LLM_API_KEY}` },
+        model: 'gpt-4o'
+      };
+    case 'grok':
+      return {
+        url: 'https://api.x.ai/v1/chat/completions',
+        headers: { 'Authorization': `Bearer ${env.LLM_API_KEY}` },
+        model: 'grok-2-vision-1212'
+      };
+  }
+}
+
+/** Try self-hosted first; on failure, fall back to cloud provider. */
+async function callLLM(messages: any[], env: Env): Promise<{ result: any; provider: string }> {
+  const primary = getProviderConfig('selfhosted', env);
+  const fallback = getProviderConfig(
+    (env.LLM_FALLBACK_PROVIDER as LLMProvider) || 'chatllm', env
+  );
+
+  // 1. Try self-hosted
+  try {
+    const res = await fetch(primary.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...primary.headers },
+      body: JSON.stringify({ model: primary.model, messages }),
+      signal: AbortSignal.timeout(120_000)  // 2 min timeout for local inference
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return { result: data, provider: `selfhosted/${primary.model}` };
+    }
+    console.log(`Self-hosted LLM returned ${res.status}, falling back...`);
+  } catch (err) {
+    console.log(`Self-hosted LLM unreachable: ${err}, falling back...`);
+  }
+
+  // 2. Fall back to cloud
+  const res = await fetch(fallback.url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...fallback.headers },
+    body: JSON.stringify({ model: fallback.model, messages })
+  });
+  if (!res.ok) throw new Error(`Fallback LLM also failed: ${res.status}`);
+  const data = await res.json();
+  return { result: data, provider: `cloud/${fallback.model}` };
+}
+```
+
+The `provider` field in the return value gets logged to D1, so you can track how often the fallback is used.
+
+Configure in wrangler.toml `[vars]`:
+- `LLM_PROVIDER = "selfhosted"` — primary (tried first)
+- `LLM_FALLBACK_PROVIDER = "chatllm"` — cloud fallback (or `"grok"`)
 
 ---
 
@@ -623,8 +954,11 @@ bucket_name = "form-claw-assets"
 
 [vars]
 PDF_SERVICE_URL = "https://pdf.savlil.com"
-DASHBOARD_URL = "https://form-claw.abacusai.app"
-LLM_PROVIDER = "chatllm"
+DASHBOARD_URL = "https://formclaw.savlil.com"
+LLM_PROVIDER = "selfhosted"           # or "chatllm" or "grok"
+LLM_API_URL = "https://llm.savlil.com/v1/chat/completions"
+LLM_MODEL = "gemma4:12b"
+LLM_FALLBACK_PROVIDER = "chatllm"     # auto-fallback if self-hosted is down
 WHITELISTED_SENDERS = "k6622024@gmail.com,2396119@gmail.com"
 ```
 
@@ -642,8 +976,11 @@ WHITELISTED_SENDERS = "k6622024@gmail.com,2396119@gmail.com"
 | Variable | Value |
 |----------|-------|
 | `PDF_SERVICE_URL` | `https://pdf.savlil.com` |
-| `DASHBOARD_URL` | `https://form-claw.abacusai.app` |
-| `LLM_PROVIDER` | `chatllm` or `grok` |
+| `DASHBOARD_URL` | `https://formclaw.savlil.com` |
+| `LLM_PROVIDER` | `selfhosted`, `chatllm`, or `grok` |
+| `LLM_API_URL` | `https://llm.savlil.com/v1/chat/completions` (for self-hosted) |
+| `LLM_MODEL` | `gemma4:12b` (or `qwen2.5-vl:7b`, etc.) |
+| `LLM_FALLBACK_PROVIDER` | `chatllm` (used if primary is down) |
 | `WHITELISTED_SENDERS` | `k6622024@gmail.com,2396119@gmail.com,...` |
 
 ### CI/CD via GitHub Actions
@@ -715,18 +1052,20 @@ Estimated tokens per form: ~5,000 input + ~3,500 output (single page form)
 
 ### Monthly cost at 2 forms/day (60 forms/month)
 
-| Component | Option A: ChatLLM | Option B: Grok (xAI) |
-|-----------|-------------------|----------------------|
-| **LLM API** | Included in Abacus sub | ~$0.60 input + ~$2.10 output = **~$2.70/mo** |
-| **Cloudflare Workers** | Free tier (100K req/day) | Free tier |
-| **Cloudflare D1** | Free tier (5GB, 5M reads/day) | Free tier |
-| **Cloudflare R2** | Free tier (10GB) | Free tier |
-| **Cloudflare Email Routing** | Free | Free |
-| **Resend API** | Free tier (100 emails/day) | Free tier |
-| **Home VM (Proxmox)** | $0 (your hardware + electricity) | $0 |
-| **GitHub** | Free | Free |
-| | | |
-| **Total monthly** | **~$0/mo** (Abacus sub covers LLM) | **~$3/mo** |
+| Component | Option A: ChatLLM | Option B: Grok (xAI) | Option C: Self-Hosted LLM |
+|-----------|-------------------|----------------------|---------------------------|
+| **LLM API** | Included in Abacus sub | ~$2.70/mo | $0 (your hardware) |
+| **Cloudflare Workers** | Free tier | Free tier | Free tier |
+| **Cloudflare D1** | Free tier (5GB) | Free tier | Free tier |
+| **Cloudflare R2** | Free tier (10GB) | Free tier | Free tier |
+| **Cloudflare Email Routing** | Free | Free | Free |
+| **Resend API** | Free tier | Free tier | Free tier |
+| **Home VM (PDF + Dashboard)** | $0 (your HW) | $0 (your HW) | $0 (your HW) |
+| **Home VM (Ollama + GPU)** | — | — | ~$3-8/mo electricity |
+| **GitHub** | Free | Free | Free |
+| | | | |
+| **Total monthly** | **~$0/mo** | **~$3/mo** | **~$3-8/mo** (electricity only) |
+| **Total one-time** | $0 | $0 | $0–$400 (GPU if buying new) |
 
 ### Token math for Grok
 
@@ -771,10 +1110,14 @@ Monthly (60 forms): 60 × $0.045 = $2.70
   - Heartbeat reporting
 - [ ] Deploy and wire up email intake Worker
 
-### Phase 4: Dashboard Reconnection (1 day)
-- [ ] Add D1→Abacus Postgres sync (Cron Trigger or D1 REST API adapter)
+### Phase 4: Dashboard Self-Hosting (1-2 days)
+- [ ] Install Node.js 20 on the VM (same LXC or sibling)
+- [ ] Replace Prisma with D1 HTTP client in all API routes (~10 files)
+- [ ] Set up NextAuth with local SQLite or Cloudflare Access
+- [ ] Build and deploy via systemd service
+- [ ] Add `formclaw.savlil.com` ingress to Cloudflare Tunnel
 - [ ] Update health check endpoint for new architecture
-- [ ] Test all dashboard pages with synced data
+- [ ] Test all dashboard pages with D1 data
 
 ### Phase 5: Cutover & Monitoring (1 day)
 - [ ] Update email intake Worker's `WEBHOOK_URL` to processor Worker
@@ -782,7 +1125,16 @@ Monthly (60 forms): 60 × $0.045 = $2.70
 - [ ] Monitor first 24h of production
 - [ ] Disable old Abacus daemon
 
-**Total estimated effort: 6-9 days**
+### Phase 6 (optional): Self-Hosted LLM
+- [ ] Install Ollama on the VM (or a dedicated GPU-passthrough VM)
+- [ ] Pull Gemma 4 12B (or Qwen2.5-VL-7B for better Hebrew)
+- [ ] Set up GPU passthrough if using dedicated GPU
+- [ ] Add `llm.savlil.com` ingress to Cloudflare Tunnel (or route internally)
+- [ ] Test with 10+ real Hebrew forms, compare quality vs ChatLLM
+- [ ] Switch `LLM_PROVIDER` to `selfhosted` in wrangler.toml if quality is acceptable
+- [ ] Configure fallback: if self-hosted is down, retry with ChatLLM
+
+**Total estimated effort: 7-11 days** (8-12 with Phase 6)
 
 ---
 
@@ -794,6 +1146,8 @@ Monthly (60 forms): 60 × $0.045 = $2.70
 | Hebrew RTL quality degrades with Grok vs GPT-4o | Incorrect field fills | Test both providers with 5+ real forms before switching; keep ChatLLM as fallback |
 | Home VM downtime (power outage, Proxmox reboot) | Processing queued/fails | UPS for Proxmox host; Worker retries with exponential backoff; email stays in Cloudflare queue |
 | Home internet outage | VM unreachable | Cloudflare Tunnel auto-reconnects; forms queue in Worker until VM is back; set 3-retry with 30s delay |
+| Self-hosted LLM Hebrew quality | Incorrect field mapping | Test 10+ real forms; keep ChatLLM as `LLM_FALLBACK_PROVIDER`; hybrid mode possible (self-hosted for English, ChatLLM for Hebrew) |
+| GPU memory exhaustion | Ollama OOM | Use quantized model (Q4); limit concurrent requests to 1; set `OLLAMA_MAX_LOADED_MODELS=1` |
 | PDF page-to-image conversion needed for vision | Workers can't render PDFs | Do PDF→PNG conversion in the home VM Python service; return images to Worker for LLM call |
 | D1 schema drift from Prisma schema | Dashboard data mismatch | Maintain single source-of-truth SQL migration files; apply to both D1 and Prisma schema in same PR |
 
@@ -803,12 +1157,12 @@ Monthly (60 forms): 60 × $0.045 = $2.70
 
 | Question | Recommended Choice |
 |----------|--------------------|
-| LLM Provider | Start with **ChatLLM** (free, tested). Switch to **Grok** if leaving Abacus. |
+| LLM Provider | **Self-hosted Gemma 4 12B** (free, private). Fall back to **ChatLLM** or **Grok** if quality issues. |
 | PDF Processing | **Self-hosted Python API on Proxmox VM** via Cloudflare Tunnel |
 | Database | **Cloudflare D1** (SQLite, free tier, native to Workers) |
-| Storage (assets) | **Local disk on home VM** (signatures, fonts) |
+| Storage (assets) | **Local disk on home VM** (signatures, fonts, model weights) |
 | Storage (output) | **Cloudflare R2** (optional backup for filled PDFs) |
-| Dashboard | **Keep on Abacus** (phase 1). Self-host on VM later (optional). |
+| Dashboard | **Self-hosted on Proxmox VM** via Cloudflare Tunnel |
 | CI/CD | **GitHub Actions → Wrangler** (Workers) + **SSH deploy** (VM) |
 | Analytics API | **Cloudflare D1 + GraphQL** (see Section 14) |
 
@@ -938,6 +1292,7 @@ For Phase 1-5, the existing REST endpoints on the Abacus dashboard are sufficien
 - 🔄 Form processor: Abacus AI daemon → Cloudflare Worker + home VM Python API
 - 🔄 Database: Abacus-hosted PostgreSQL → Cloudflare D1 (SQLite)
 - 🔄 Asset storage: Abacus VM filesystem → Home VM local disk
-- 🔄 LLM calls: Abacus built-in agent → Direct API calls (ChatLLM or Grok)
+- 🔄 LLM calls: Abacus built-in agent → Self-hosted Gemma 4 / Ollama (or ChatLLM / Grok as fallback)
 - 🔄 Code execution: Abacus agent Python sandbox → Self-hosted FastAPI on Proxmox
+- 🔄 Dashboard: Abacus-hosted → Self-hosted on Proxmox VM via Cloudflare Tunnel
 - 🔄 Analytics (future): REST → GraphQL on Cloudflare Worker
