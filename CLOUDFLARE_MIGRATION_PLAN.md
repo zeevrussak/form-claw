@@ -58,7 +58,7 @@ This means the migration is NOT about porting a fixed codebase — it's about:
 
 ---
 
-## 2. Target Architecture (fully on Cloudflare)
+## 2. Target Architecture (Cloudflare + self-hosted VM)
 
 ```
 ┌─────────────────┐    ┌──────────────────────────────────────────────┐
@@ -75,17 +75,39 @@ This means the migration is NOT about porting a fixed codebase — it's about:
                        │  2. Security filter (port scan_email_content)  │
                        │  3. Call LLM vision API to analyze PDF pages   │
                        │  4. Call LLM to generate fill instructions     │
-                       │  5. Call Python sandbox API to execute fill    │
+                       │  5. Call home VM Python API to execute fill    │
                        │     (ReportLab + PyPDF2 + signature overlay)   │
                        │  6. Send filled PDF via Resend API             │
-                       │  7. Log to database                            │
+                       │  7. Log to Cloudflare D1                       │
                        └───────────────────────────────────────────────┘
 
 ┌──────────────────────┐    ┌──────────────────────┐
-│ Neon / Supabase /    │    │ Cloudflare Pages     │
-│ PlanetScale          │    │ (dashboard — optional│
-│ (PostgreSQL)         │    │  can stay on Abacus) │
-└──────────────────────┘    └──────────────────────┘
+│ Cloudflare D1        │    │ Dashboard            │
+│ (SQLite at edge)     │    │ (stays on Abacus OR  │
+│ - form processing    │    │  moves to Cloudflare │
+│   logs               │    │  Pages — your call)  │
+│ - system_status      │    └──────────────────────┘
+│ - knowledge_entries  │
+│ - app_config         │
+└──────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ HOME PROXMOX VM  (fixed IP, reverse-proxied via Cloudflare │
+│                   Tunnel or direct with DDNS)               │
+│                                                             │
+│  ┌─────────────────────────────────────────┐                │
+│  │ Python API (FastAPI / Flask)            │                │
+│  │  POST /fill-pdf                         │                │
+│  │  • ReportLab, PyPDF2, Pillow            │                │
+│  │  • Signatures & fonts on local disk     │                │
+│  │  • Token-authenticated                  │                │
+│  └─────────────────────────────────────────┘                │
+│                                                             │
+│  Assets: signatures/, fonts/, family_data.json              │
+│  OS: Debian/Ubuntu LXC or VM (lightweight)                  │
+│  RAM: 512MB–1GB sufficient                                  │
+│  Disk: <1GB                                                 │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -111,7 +133,7 @@ This is the core challenge. The current processor is an AI agent with:
 - No file system — must use R2 for storage
 - Memory limit: 128MB
 
-**Proposed approach**: The Worker becomes an **orchestrator** that calls external services:
+**Proposed approach**: The Worker becomes an **orchestrator** that calls your home VM + LLM API:
 
 ```
 form-claw-processor (JS/TS Worker)
@@ -121,44 +143,113 @@ form-claw-processor (JS/TS Worker)
   │     • Determine field coordinates & values
   │     • Generate fill instructions JSON
   │
-  ├─▶ PDF Processing API (external)
-  │     • Option A: Self-hosted microservice (e.g., on Fly.io/Railway)
-  │       running Python with ReportLab/PyPDF2
-  │     • Option B: Use pdf-lib (JS) for simple fills + Cloudflare Workers
-  │       ⚠️ pdf-lib can't do: ReportLab overlays, Hebrew RTL shaping,
-  │         precise coordinate placement, transparent PNG overlay — this
-  │         would require significant rewriting
-  │     • Option C: Use a serverless function (AWS Lambda / GCP Cloud Run)
-  │       with the Python fill logic
+  ├─▶ Home VM Python API (self-hosted on Proxmox)
+  │     • Receives fill instructions + PDF + signature refs
+  │     • Executes ReportLab/PyPDF2 fill
+  │     • Returns filled PDF base64
+  │     • Assets (signatures, fonts) stored locally on the VM
   │
   ├─▶ R2 (Cloudflare object storage)
-  │     • Store signature PNGs, fonts, family_data.json
-  │     • Store filled PDFs temporarily
+  │     • Store filled PDFs temporarily (optional backup)
   │
   ├─▶ Resend API (send reply — already working)
   │
-  └─▶ Database (Neon Postgres — serverless, HTTP-based)
+  └─▶ Cloudflare D1 (SQLite)
         • Log processing events
         • System status
+        • Knowledge base
 ```
 
-### 3.3 Database
+### 3.3 Database — Cloudflare D1
 
 **Current**: Abacus-hosted PostgreSQL  
-**Target**: [Neon](https://neon.tech) serverless PostgreSQL (free tier: 0.5GB storage, auto-suspend)  
-**Why Neon**: HTTP-based driver (`@neondatabase/serverless`) works inside Workers, auto-scales, free tier sufficient for this volume  
-**Migration**: Export schema + data from current DB, import into Neon  
-**Alternative**: Cloudflare D1 (SQLite) — simpler but requires schema rewrite from PostgreSQL syntax
+**Target**: [Cloudflare D1](https://developers.cloudflare.com/d1/) (SQLite at the edge)  
+**Why D1**: Native Cloudflare integration — zero latency from Workers, no external connection strings, free tier generous (5GB storage, 5M reads/day, 100K writes/day), zero cold-start  
+
+**Migration work**:
+- Rewrite Prisma schema → D1 SQL schema (SQLite dialect: no `@db.Text`, no enums, `REAL` instead of `Decimal`, `TEXT` for DateTime stored as ISO strings)
+- Replace Prisma ORM calls in the Worker with D1 prepared statements (direct `env.DB.prepare()`)
+- Dashboard can either:
+  - (a) Keep Prisma and read from D1 via the Cloudflare REST API (`/client/v4/accounts/.../d1/database/.../query`), or
+  - (b) Stay on Abacus Postgres and sync data via a lightweight D1→Postgres replication (a Cron Trigger that pushes new rows)
+
+**D1 Schema** (SQLite equivalent of current Prisma models):
+
+```sql
+CREATE TABLE form_processing_log (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  sender_email TEXT,
+  sender_name TEXT,
+  subject TEXT,
+  received_at TEXT DEFAULT (datetime('now')),
+  processing_status TEXT DEFAULT 'pending',
+  processing_time_seconds REAL,
+  target_person TEXT,
+  error_type TEXT,
+  error_message TEXT,
+  filled_pdf_url TEXT,
+  original_pdf_url TEXT,
+  ai_notes TEXT
+);
+
+CREATE TABLE system_status (
+  id INTEGER PRIMARY KEY DEFAULT 1,
+  email_source TEXT DEFAULT 'cloudflare',
+  webhook_enabled INTEGER DEFAULT 1,
+  form_process_status TEXT DEFAULT 'ok',
+  last_form_processed TEXT,
+  last_error_at TEXT,
+  last_cloudflare_email TEXT,
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE knowledge_entry (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  category TEXT DEFAULT 'general',
+  language TEXT DEFAULT 'he',
+  applies_to_person TEXT,
+  source TEXT DEFAULT 'manual',
+  is_active INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE app_config (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  key TEXT UNIQUE NOT NULL,
+  value TEXT NOT NULL,
+  label TEXT,
+  category TEXT DEFAULT 'general',
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_log_received ON form_processing_log(received_at);
+CREATE INDEX idx_log_status ON form_processing_log(processing_status);
+CREATE INDEX idx_knowledge_active ON knowledge_entry(is_active, category);
+```
 
 ### 3.4 Dashboard
 
-**Option A** (recommended): Keep on Abacus — it works, it's free, minimal maintenance  
-**Option B**: Move to Cloudflare Pages — Next.js on Pages has some limitations (no `getServerSideProps` in edge runtime, must use Pages Functions). Would require:
-- Converting auth to Cloudflare Access or custom JWT
-- Replacing Prisma with Drizzle (works better with D1/Neon in edge)
-- Significant effort for low value
+**Option A** (recommended for phase 1): Keep on Abacus  
+- Dashboard continues to work as-is, using Abacus Postgres
+- Add a D1 sync: Processor Worker writes to D1, a Cron Trigger pushes new rows to Abacus Postgres hourly
+- Zero dashboard code changes
 
-**Recommendation**: Leave dashboard on Abacus, point it to the new Neon database.
+**Option B** (full migration): Move to Cloudflare Pages + D1  
+- Next.js on Pages has limitations (edge runtime, no native Prisma)
+- Replace Prisma with `better-sqlite3` client via D1 HTTP API or Drizzle ORM with D1 driver
+- Auth: Cloudflare Access (free for ≤50 users) replaces NextAuth + Google SSO
+- Significant rewrite but zero external dependencies
+
+**Option C** (self-host dashboard on Proxmox VM too)  
+- Run the Next.js dashboard directly on the home VM
+- Use D1 HTTP API for reads or run a local SQLite replica synced from D1
+- Expose via Cloudflare Tunnel (dashboard.savlil.com → VM:3000)
+- Full control, but adds VM maintenance burden
+
+**Recommendation**: Start with **Option A** (keep on Abacus), migrate to **Option C** later if desired.
 
 ### 3.5 Health Monitoring
 
@@ -266,71 +357,211 @@ const response = await fetch('https://api.x.ai/v1/chat/completions', {
 
 ---
 
-## 5. The Python Sandbox Problem
+## 5. The Python Sandbox — Self-Hosted on Proxmox
 
-This is the **biggest challenge**. The form filler needs Python with:
+The form filler needs Python with:
 - `reportlab` — PDF overlay creation with precise coordinates
 - `PyPDF2` — PDF merging
 - `Pillow` — Signature image processing (RGBA transparency)
 - Hebrew text shaping (RTL)
 
-**Cloudflare Workers cannot run Python natively.**
+**Cloudflare Workers cannot run Python natively.** But you have a home server — so we self-host.
 
-### Solutions:
+### 5a. Home VM Python API (recommended) ✅
 
-#### 5a. External Python Microservice (recommended)
+Run a lightweight Python API on a **Proxmox LXC container or VM** at home.
 
-Deploy a lightweight Python API on **Fly.io** (free tier: 3 shared VMs) or **Railway**:
+#### VM / LXC Requirements
 
-```python
-# POST /fill-pdf
-# Body: { original_pdf_b64, fill_instructions: [...], signature_b64, signer_id, date }
-# Returns: { filled_pdf_b64 }
+| Requirement | Minimum | Recommended |
+|-------------|---------|-------------|
+| **OS** | Debian 12 / Ubuntu 22.04 (LXC or VM) | Ubuntu 24.04 LXC (lowest overhead) |
+| **CPU** | 1 vCPU | 2 vCPU (PDF rendering benefits from extra core) |
+| **RAM** | 512 MB | 1 GB (ReportLab + Pillow peak during render) |
+| **Disk** | 2 GB | 5 GB (OS + Python + deps + fonts + signatures + logs) |
+| **Network** | Fixed IP, port forwarded (443 → VM) | Cloudflare Tunnel (zero port forwarding) |
+| **Python** | 3.10+ | 3.12 |
+
+#### Setup Steps
+
+```bash
+# 1. Create LXC container in Proxmox (or use an existing VM)
+#    Proxmox UI → Create CT → Ubuntu 24.04, 1GB RAM, 5GB disk
+
+# 2. Inside the container:
+apt update && apt install -y python3 python3-pip python3-venv
+
+# 3. Create project directory
+mkdir -p /opt/form-claw-pdf
+cd /opt/form-claw-pdf
+python3 -m venv venv
+source venv/bin/activate
+
+# 4. Install dependencies
+pip install fastapi uvicorn reportlab PyPDF2 Pillow python-multipart
+
+# 5. Copy assets
+mkdir -p assets/signatures assets/fonts
+# scp or git clone from zeevrussak/form-claw → services/pdf-filler/
+# Copy signature PNGs and font TTFs into assets/
+
+# 6. Create systemd service
+cat > /etc/systemd/system/form-claw-pdf.service << 'EOF'
+[Unit]
+Description=Form Claw PDF Filler API
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/form-claw-pdf
+ExecStart=/opt/form-claw-pdf/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8787
+Restart=always
+RestartSec=5
+Environment=PDF_SERVICE_TOKEN=<your-secret-token>
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable --now form-claw-pdf
 ```
 
-This service is stateless, receives the fill instructions (coordinates + values) from the LLM, executes the ReportLab/PyPDF2 code, and returns the filled PDF.
+#### FastAPI Application Skeleton
 
-**Cost**: Free (Fly.io free tier) or ~$3-5/month  
-**Latency**: ~2-5 seconds per fill  
-**Code**: Port the existing `fill_fnx_form.py` logic + the skill's ReportLab patterns
+```python
+# /opt/form-claw-pdf/app.py
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
+import base64, os
 
-#### 5b. pdf-lib (JavaScript, runs in Worker)
+app = FastAPI(title="Form Claw PDF Filler")
+TOKEN = os.environ.get("PDF_SERVICE_TOKEN", "change-me")
+
+class FillRequest(BaseModel):
+    original_pdf_b64: str
+    fill_instructions: list[dict]    # [{x, y, text, font, size, color}, ...]
+    signature_id: str | None = None  # "zeev" or "keren"
+    signer_name: str | None = None
+    date_str: str | None = None
+
+class FillResponse(BaseModel):
+    filled_pdf_b64: str
+    pages_processed: int
+
+@app.post("/fill-pdf", response_model=FillResponse)
+async def fill_pdf(req: FillRequest, authorization: str = Header(...)):
+    if authorization != f"Bearer {TOKEN}":
+        raise HTTPException(401, "Unauthorized")
+    # ... ReportLab + PyPDF2 fill logic here (ported from fill_fnx_form.py) ...
+    return FillResponse(filled_pdf_b64="...", pages_processed=1)
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+```
+
+#### Exposing the VM to the Internet
+
+**Option 1: Cloudflare Tunnel (recommended — zero port forwarding)**
+```bash
+# Install cloudflared on the VM
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+dpkg -i cloudflared.deb
+
+# Login and create tunnel
+cloudflared tunnel login
+cloudflared tunnel create form-claw-pdf
+
+# Configure
+cat > /etc/cloudflared/config.yml << EOF
+tunnel: <TUNNEL_ID>
+credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
+ingress:
+  - hostname: pdf.savlil.com
+    service: http://localhost:8787
+  - service: http_status:404
+EOF
+
+# DNS: add CNAME pdf.savlil.com → <TUNNEL_ID>.cfargotunnel.com
+cloudflared tunnel route dns form-claw-pdf pdf.savlil.com
+
+# Run as service
+cloudflared service install
+systemctl enable --now cloudflared
+```
+
+Result: `https://pdf.savlil.com/fill-pdf` is publicly reachable, TLS terminated by Cloudflare, no ports exposed.
+
+**Option 2: Direct with fixed IP**
+- Port-forward 443 → VM port 8787 on your router
+- Use Caddy or Nginx as reverse proxy with Let's Encrypt TLS
+- DNS A record: `pdf.savlil.com → <your-fixed-IP>`
+- Less secure (IP exposed) but works without Cloudflare Tunnel
+
+**Recommendation**: Use Cloudflare Tunnel — it's free, secure, and integrates with your existing Cloudflare setup.
+
+#### Auto-Update from GitHub
+
+```bash
+# /opt/form-claw-pdf/update.sh
+#!/bin/bash
+cd /opt/form-claw-pdf
+git pull origin main
+source venv/bin/activate
+pip install -r requirements.txt --quiet
+systemctl restart form-claw-pdf
+echo "Updated at $(date)"
+```
+
+Add a cron job or GitHub Actions webhook to trigger updates:
+```bash
+# Check for updates every hour
+0 * * * * /opt/form-claw-pdf/update.sh >> /var/log/form-claw-update.log 2>&1
+```
+
+Or use a GitHub Actions deploy step that SSHs into the VM (see Section 7).
+
+### 5b. pdf-lib (JavaScript, runs in Worker) — NOT RECOMMENDED
 
 Use [pdf-lib](https://pdf-lib.js.org/) for basic PDF manipulation inside the Worker itself.
 
 **Limitations**:
-- ❌ No Hebrew RTL text shaping (would need additional WASM shaping library)
+- ❌ No Hebrew RTL text shaping
 - ❌ No transparent PNG overlay with the same quality as ReportLab
-- ⚠️ Coordinate placement possible but less precise than ReportLab
 - ❌ No ellipse drawing for OR/slash selection
 
-**Verdict**: Not suitable for the current form complexity. Would require significant feature regression.
+**Verdict**: Not suitable for the current form complexity.
 
-#### 5c. Cloudflare Workers + Python (experimental)
+### 5c. Cloudflare Workers + Python (experimental) — NOT READY
 
-Cloudflare now has **Python Workers** (beta). However:
-- Limited package support (no ReportLab, no PyPDF2)
-- Still in beta with restrictions
-- Not production-ready for this use case
-
-**Recommendation**: Use **5a** (external Python microservice on Fly.io).
+Cloudflare Python Workers (beta) don't support ReportLab/PyPDF2. Not viable.
 
 ---
 
-## 6. Storage: Cloudflare R2
+## 6. Storage: Split Strategy
 
-Replace local file system with R2:
+### Static assets → Home VM local disk (simplest)
 
-| Asset | Current Location | R2 Key |
-|-------|-----------------|--------|
-| Ze'ev's signature | `/home/ubuntu/shared/zr signature nxp.png` | `assets/signatures/zeev.png` |
-| Keren's signature | `/home/ubuntu/shared/keren sig.png` | `assets/signatures/keren.png` |
-| Hebrew font | `/home/ubuntu/shared/fonts/FtPilKahol2.ttf` | `assets/fonts/FtPilKahol2.ttf` |
-| English font | `/home/ubuntu/shared/fonts/Playzone.ttf` | `assets/fonts/Playzone.ttf` |
-| Family data | `/home/ubuntu/shared/family_data.json` | `config/family_data.json` |
-| Filled PDFs | `/home/ubuntu/shared/formbot_work/` | `output/<timestamp>/` |
+Since the Python API runs on your Proxmox VM, static assets live there directly — no need to fetch from R2 on every request:
 
-**Cost**: R2 free tier — 10GB storage, 10M reads/month, 1M writes/month. More than enough.
+| Asset | VM Path |
+|-------|---------|
+| Ze'ev's signature | `/opt/form-claw-pdf/assets/signatures/zeev.png` |
+| Keren's signature | `/opt/form-claw-pdf/assets/signatures/keren.png` |
+| Hebrew font | `/opt/form-claw-pdf/assets/fonts/FtPilKahol2.ttf` |
+| English font | `/opt/form-claw-pdf/assets/fonts/Playzone.ttf` |
+| Family data | `/opt/form-claw-pdf/assets/family_data.json` |
+
+### Output PDFs → Cloudflare R2 (optional backup)
+
+| Asset | R2 Key |
+|-------|--------|
+| Filled PDFs | `output/<timestamp>/<filename>_filled.pdf` |
+
+R2 is useful if you want the dashboard to serve download links for filled PDFs. Otherwise, filled PDFs are attached directly to the Resend reply email and don't need persistent storage.
+
+**R2 Cost**: Free tier — 10GB storage, 10M reads/month, 1M writes/month. More than enough.
 
 ---
 
@@ -347,21 +578,29 @@ form-claw/
 │   │   ├── src/index.ts
 │   │   ├── wrangler.toml
 │   │   └── package.json
-│   └── form-processor/        # NEW: orchestrator worker
-│       ├── src/
-│       │   ├── index.ts        # main handler
-│       │   ├── llm.ts          # LLM API client (ChatLLM or Grok)
-│       │   ├── security.ts     # port of security_filter.py
-│       │   ├── pdf-service.ts  # calls external Python API
-│       │   └── db.ts           # Neon database client
+│   ├── form-processor/        # NEW: orchestrator worker
+│   │   ├── src/
+│   │   │   ├── index.ts        # main handler
+│   │   │   ├── llm.ts          # LLM API client (ChatLLM or Grok)
+│   │   │   ├── security.ts     # port of security_filter.py
+│   │   │   ├── pdf-service.ts  # calls home VM Python API
+│   │   │   └── db.ts           # D1 database client
+│   │   ├── wrangler.toml
+│   │   └── package.json
+│   └── analytics/             # OPTIONAL Phase 6: GraphQL analytics
+│       ├── src/index.ts
 │       ├── wrangler.toml
 │       └── package.json
 ├── services/
-│   └── pdf-filler/             # Python microservice (Fly.io)
+│   └── pdf-filler/             # Python API (runs on home Proxmox VM)
 │       ├── app.py
 │       ├── requirements.txt
-│       ├── Dockerfile
-│       └── fly.toml
+│       └── assets/
+│           ├── signatures/
+│           ├── fonts/
+│           └── family_data.json
+├── d1/
+│   └── schema.sql              # D1 schema (source of truth)
 └── nextjs_space/               # existing dashboard (stays on Abacus)
 ```
 
@@ -373,13 +612,20 @@ name = "form-claw-processor"
 main = "src/index.ts"
 compatibility_date = "2026-01-01"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "form-claw"
+database_id = "<your-d1-database-id>"
+
 [[r2_buckets]]
 binding = "ASSETS"
 bucket_name = "form-claw-assets"
 
 [vars]
-FAMILY_DATA_KEY = "config/family_data.json"
-PDF_SERVICE_URL = "https://form-claw-pdf.fly.dev"
+PDF_SERVICE_URL = "https://pdf.savlil.com"
+DASHBOARD_URL = "https://form-claw.abacusai.app"
+LLM_PROVIDER = "chatllm"
+WHITELISTED_SENDERS = "k6622024@gmail.com,2396119@gmail.com"
 ```
 
 ### Cloudflare Secrets (via `wrangler secret put`)
@@ -387,19 +633,18 @@ PDF_SERVICE_URL = "https://form-claw-pdf.fly.dev"
 | Secret Name | Purpose | Source |
 |------------|---------|--------|
 | `RESEND_API_KEY` | Send reply emails | Resend dashboard |
-| `DATABASE_URL` | Neon PostgreSQL connection | Neon dashboard |
 | `LLM_API_KEY` | LLM API authentication | See Option A or B below |
-| `PDF_SERVICE_TOKEN` | Auth for Python microservice | Self-generated |
+| `PDF_SERVICE_TOKEN` | Auth for home VM Python API | Self-generated (e.g., `openssl rand -hex 32`) |
 | `HEARTBEAT_TOKEN` | Dashboard health reporting | Existing value |
 
-### Cloudflare Variables (non-secret, in wrangler.toml)
+### Cloudflare Variables (non-secret, in wrangler.toml `[vars]`)
 
 | Variable | Value |
 |----------|-------|
-| `WHITELISTED_SENDERS` | `k6622024@gmail.com,2396119@gmail.com,...` |
-| `PDF_SERVICE_URL` | `https://form-claw-pdf.fly.dev` |
+| `PDF_SERVICE_URL` | `https://pdf.savlil.com` |
 | `DASHBOARD_URL` | `https://form-claw.abacusai.app` |
 | `LLM_PROVIDER` | `chatllm` or `grok` |
+| `WHITELISTED_SENDERS` | `k6622024@gmail.com,2396119@gmail.com,...` |
 
 ### CI/CD via GitHub Actions
 
@@ -419,7 +664,39 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           workingDirectory: workers/form-processor
+
+# .github/workflows/deploy-pdf-service.yml
+name: Deploy PDF Service to Home VM
+on:
+  push:
+    branches: [main]
+    paths: ['services/pdf-filler/**']
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: pdf.savlil.com  # or your fixed IP
+          username: root
+          key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+          script: |
+            cd /opt/form-claw-pdf
+            git pull origin main
+            source venv/bin/activate
+            pip install -r requirements.txt --quiet
+            systemctl restart form-claw-pdf
+            echo "Deployed at $(date)"
 ```
+
+### GitHub Secrets Required
+
+| Secret | Purpose |
+|--------|---------|
+| `CLOUDFLARE_API_TOKEN` | Deploy Workers via Wrangler |
+| `VM_SSH_PRIVATE_KEY` | SSH deploy to Proxmox VM |
 
 ---
 
@@ -442,11 +719,11 @@ Estimated tokens per form: ~5,000 input + ~3,500 output (single page form)
 |-----------|-------------------|----------------------|
 | **LLM API** | Included in Abacus sub | ~$0.60 input + ~$2.10 output = **~$2.70/mo** |
 | **Cloudflare Workers** | Free tier (100K req/day) | Free tier |
+| **Cloudflare D1** | Free tier (5GB, 5M reads/day) | Free tier |
 | **Cloudflare R2** | Free tier (10GB) | Free tier |
 | **Cloudflare Email Routing** | Free | Free |
-| **Neon PostgreSQL** | Free tier (0.5GB) | Free tier |
 | **Resend API** | Free tier (100 emails/day) | Free tier |
-| **Python microservice (Fly.io)** | Free tier (3 VMs) | Free tier |
+| **Home VM (Proxmox)** | $0 (your hardware + electricity) | $0 |
 | **GitHub** | Free | Free |
 | | | |
 | **Total monthly** | **~$0/mo** (Abacus sub covers LLM) | **~$3/mo** |
@@ -469,34 +746,39 @@ Monthly (60 forms): 60 × $0.045 = $2.70
 ## 9. Implementation Phases
 
 ### Phase 1: Foundation (1-2 days)
-- [ ] Create Neon PostgreSQL database, import schema
-- [ ] Create R2 bucket, upload assets (signatures, fonts, family_data.json)
-- [ ] Set up GitHub Actions for Cloudflare deployment
+- [ ] Create Cloudflare D1 database with schema (see Section 3.3)
+- [ ] Create R2 bucket (for optional output PDF backup)
+- [ ] Set up GitHub repo structure (`workers/`, `services/`)
+- [ ] Set up GitHub Actions for Cloudflare + VM deployment
 
-### Phase 2: Python Microservice (1-2 days)
-- [ ] Port `fill_fnx_form.py` and the skill's fill logic into a stateless API
-- [ ] Deploy to Fly.io
-- [ ] Test with known form + fill instructions
+### Phase 2: Home VM Setup (1-2 days)
+- [ ] Provision LXC container on Proxmox (Ubuntu 24.04, 1GB RAM, 5GB disk)
+- [ ] Install Python 3.12, create venv, install deps (FastAPI, ReportLab, PyPDF2, Pillow)
+- [ ] Port `fill_fnx_form.py` + skill logic into stateless FastAPI `/fill-pdf` endpoint
+- [ ] Copy assets (signatures, fonts, family_data.json) into `/opt/form-claw-pdf/assets/`
+- [ ] Set up Cloudflare Tunnel (`pdf.savlil.com` → VM:8787)
+- [ ] Set up systemd service for auto-start
+- [ ] Test with known form + fill instructions via curl
 
 ### Phase 3: Processor Worker (2-3 days)
 - [ ] Write `form-claw-processor` Worker:
   - Webhook handler
   - Security filter (port `security_filter.py` to TypeScript)
   - LLM client (with provider switch: ChatLLM / Grok)
-  - PDF service client
+  - PDF service client (calls `https://pdf.savlil.com/fill-pdf`)
   - Resend client (port `send_resend_reply.py` logic)
-  - DB logging (Neon HTTP client)
+  - D1 logging (`env.DB.prepare()` statements)
   - Heartbeat reporting
 - [ ] Deploy and wire up email intake Worker
 
 ### Phase 4: Dashboard Reconnection (1 day)
-- [ ] Point dashboard to new Neon database
+- [ ] Add D1→Abacus Postgres sync (Cron Trigger or D1 REST API adapter)
 - [ ] Update health check endpoint for new architecture
-- [ ] Test all dashboard pages with new data source
+- [ ] Test all dashboard pages with synced data
 
 ### Phase 5: Cutover & Monitoring (1 day)
 - [ ] Update email intake Worker's `WEBHOOK_URL` to processor Worker
-- [ ] Run end-to-end test
+- [ ] Run end-to-end test (email → fill → reply)
 - [ ] Monitor first 24h of production
 - [ ] Disable old Abacus daemon
 
@@ -510,9 +792,10 @@ Monthly (60 forms): 60 × $0.045 = $2.70
 |------|--------|------------|
 | Worker 30s CPU limit exceeded on complex forms | Processing fails | Use Cloudflare Workers Unbound (no CPU limit, $0.02/M requests) or offload heavy work to Python service |
 | Hebrew RTL quality degrades with Grok vs GPT-4o | Incorrect field fills | Test both providers with 5+ real forms before switching; keep ChatLLM as fallback |
-| Fly.io free tier cold starts | Slow first fill after idle | Use Fly.io `min_machines_running = 1` ($3/mo) or accept 2-3s delay |
-| PDF page-to-image conversion needed for vision | Workers can't render PDFs | Do PDF→PNG conversion in the Python microservice; return images to Worker for LLM call |
-| Neon free tier auto-suspends after 5min idle | First request slow | Accept ~1s cold start, or use Neon Pro ($19/mo) for always-on |
+| Home VM downtime (power outage, Proxmox reboot) | Processing queued/fails | UPS for Proxmox host; Worker retries with exponential backoff; email stays in Cloudflare queue |
+| Home internet outage | VM unreachable | Cloudflare Tunnel auto-reconnects; forms queue in Worker until VM is back; set 3-retry with 30s delay |
+| PDF page-to-image conversion needed for vision | Workers can't render PDFs | Do PDF→PNG conversion in the home VM Python service; return images to Worker for LLM call |
+| D1 schema drift from Prisma schema | Dashboard data mismatch | Maintain single source-of-truth SQL migration files; apply to both D1 and Prisma schema in same PR |
 
 ---
 
@@ -521,15 +804,125 @@ Monthly (60 forms): 60 × $0.045 = $2.70
 | Question | Recommended Choice |
 |----------|--------------------|
 | LLM Provider | Start with **ChatLLM** (free, tested). Switch to **Grok** if leaving Abacus. |
-| PDF Processing | **External Python microservice on Fly.io** |
-| Database | **Neon PostgreSQL** (free tier, serverless, HTTP driver) |
-| Storage | **Cloudflare R2** (free tier, native to Workers) |
-| Dashboard | **Keep on Abacus** (lowest effort, already working) |
-| CI/CD | **GitHub Actions → Wrangler** |
+| PDF Processing | **Self-hosted Python API on Proxmox VM** via Cloudflare Tunnel |
+| Database | **Cloudflare D1** (SQLite, free tier, native to Workers) |
+| Storage (assets) | **Local disk on home VM** (signatures, fonts) |
+| Storage (output) | **Cloudflare R2** (optional backup for filled PDFs) |
+| Dashboard | **Keep on Abacus** (phase 1). Self-host on VM later (optional). |
+| CI/CD | **GitHub Actions → Wrangler** (Workers) + **SSH deploy** (VM) |
+| Analytics API | **Cloudflare D1 + GraphQL** (see Section 14) |
 
 ---
 
-## 12. What Stays the Same
+## 12. Analytics via GraphQL (optional enhancement)
+
+The current dashboard reads stats via REST endpoints (`/api/stats`, `/api/stats/range`). With D1 as the data source, you could expose a **GraphQL API** on a Cloudflare Worker for analytics — this is a good fit because:
+
+### Why GraphQL works well here
+
+- **Flexible queries**: The dashboard already supports date ranges, sender filters, target-person filters, and status filters. GraphQL lets the frontend request exactly the aggregations it needs in a single request instead of multiple REST calls.
+- **D1 is SQLite**: GraphQL resolvers map cleanly to SQL queries. No ORM needed — just `env.DB.prepare()` with parameterized queries.
+- **Edge performance**: A Worker + D1 GraphQL endpoint runs at the edge with ~0ms DB latency.
+- **Schema-first**: GraphQL's typed schema documents the analytics API automatically.
+
+### Example GraphQL Schema
+
+```graphql
+type Query {
+  stats(startDate: String, endDate: String): StatsOverview!
+  dailyStats(startDate: String!, endDate: String!): [DailyStat!]!
+  logs(page: Int, limit: Int, status: String, sender: String, search: String): LogPage!
+  senderBreakdown(startDate: String, endDate: String): [SenderStat!]!
+  targetBreakdown(startDate: String, endDate: String): [TargetStat!]!
+}
+
+type StatsOverview {
+  totalForms: Int!
+  successCount: Int!
+  failureCount: Int!
+  successRate: Float!
+  avgProcessingTime: Float
+  todayCount: Int!
+}
+
+type DailyStat {
+  date: String!
+  total: Int!
+  success: Int!
+  failure: Int!
+}
+
+type LogPage {
+  logs: [FormLog!]!
+  total: Int!
+  page: Int!
+  totalPages: Int!
+}
+
+type FormLog {
+  id: String!
+  senderEmail: String
+  subject: String
+  receivedAt: String!
+  processingStatus: String!
+  processingTime: Float
+  targetPerson: String
+  errorType: String
+  errorMessage: String
+}
+
+type SenderStat { sender: String!, count: Int! }
+type TargetStat { target: String!, count: Int! }
+```
+
+### Implementation
+
+Use [`graphql-yoga`](https://the-guild.dev/graphql/yoga-server) — it runs natively in Cloudflare Workers:
+
+```typescript
+// workers/analytics/src/index.ts
+import { createYoga, createSchema } from 'graphql-yoga';
+
+export default {
+  fetch(request: Request, env: Env) {
+    const yoga = createYoga({
+      schema: createSchema({
+        typeDefs,
+        resolvers: {
+          Query: {
+            stats: async (_, { startDate, endDate }) => {
+              const result = await env.DB.prepare(
+                `SELECT COUNT(*) as total,
+                  SUM(CASE WHEN processing_status='success' THEN 1 ELSE 0 END) as success,
+                  SUM(CASE WHEN processing_status='failed' THEN 1 ELSE 0 END) as failure,
+                  AVG(processing_time_seconds) as avg_time
+                FROM form_processing_log
+                WHERE received_at BETWEEN ?1 AND ?2`
+              ).bind(startDate || '2000-01-01', endDate || '2099-12-31').first();
+              return { ...result, successRate: result.total ? result.success / result.total : 0 };
+            },
+            // ... other resolvers
+          }
+        }
+      })
+    });
+    return yoga.fetch(request, env);
+  }
+};
+```
+
+### When to add GraphQL
+
+**Not in Phase 1.** Get the core form-filling pipeline working first. GraphQL is a Phase 6 enhancement — add it once:
+1. D1 is populated with real data
+2. The dashboard needs more flexible analytics (or you want a public/mobile analytics view)
+3. You want to query analytics from multiple clients (dashboard, mobile, CLI)
+
+For Phase 1-5, the existing REST endpoints on the Abacus dashboard are sufficient.
+
+---
+
+## 13. What Stays the Same
 
 - ✅ Email intake Cloudflare Worker (already deployed)
 - ✅ Resend for outbound email (already configured)
@@ -540,10 +933,11 @@ Monthly (60 forms): 60 × $0.045 = $2.70
 - ✅ Signature assets (PNGs with transparency)
 - ✅ Form-filling skill logic (coordinate placement, ellipses, split-digit fields)
 
-## 13. What Changes
+## 14. What Changes
 
-- 🔄 Form processor: Abacus AI daemon → Cloudflare Worker + Python microservice
-- 🔄 Database: Abacus-hosted PostgreSQL → Neon serverless PostgreSQL
-- 🔄 Asset storage: Local filesystem → Cloudflare R2
+- 🔄 Form processor: Abacus AI daemon → Cloudflare Worker + home VM Python API
+- 🔄 Database: Abacus-hosted PostgreSQL → Cloudflare D1 (SQLite)
+- 🔄 Asset storage: Abacus VM filesystem → Home VM local disk
 - 🔄 LLM calls: Abacus built-in agent → Direct API calls (ChatLLM or Grok)
-- 🔄 Code execution: Abacus agent Python sandbox → Fly.io Python microservice
+- 🔄 Code execution: Abacus agent Python sandbox → Self-hosted FastAPI on Proxmox
+- 🔄 Analytics (future): REST → GraphQL on Cloudflare Worker
