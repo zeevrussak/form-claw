@@ -36,7 +36,7 @@ log = logging.getLogger("formclaw")
 
 db = firestore.Client()
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-GEMINI_API_KEY = os.environ["GOOGLE_AI_STUDIO_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "formclaw-assets")

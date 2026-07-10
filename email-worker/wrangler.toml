@@ -3,10 +3,8 @@ main = "src/index.ts"
 compatibility_date = "2024-09-25"
 
 [vars]
-# === CURRENT: Abacus AI webhook (keep until migration cutover) ===
-WEBHOOK_URL = "https://apps.abacus.ai/api/webhooks?abacus_deployment_token=MTMxODA3ODA6MTM5NjI1OTA6NTMyMTA6ZA.bd451fc3e446486225da48634634cd0c&v=1"
-# === AFTER MIGRATION: switch to Cloud Run processor ===
-# WEBHOOK_URL = "https://formclaw-processor-XXXXX.run.app/webhook"
-# WEBHOOK_SECRET = "7a3abcceb428d3f9ff6a45db2ff80eda5768f9373dc215e96562407a07e00561"
+# Cloud Run processor webhook
+WEBHOOK_URL = "https://formclaw-processor-1062781559437.us-central1.run.app/webhook"
+WEBHOOK_SECRET = "7a3abcceb428d3f9ff6a45db2ff80eda5768f9373dc215e96562407a07e00561"
 # Comma-separated whitelisted senders
 WHITELISTED_SENDERS = "k6622024@gmail.com,targetmailbox@gmail.com,2396119@gmail.com,zeev@infiniplex.life"

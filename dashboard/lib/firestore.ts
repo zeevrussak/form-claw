@@ -7,7 +7,7 @@ import { initializeApp, getApps, cert, App } from 'firebase-admin/app';
 import { getFirestore, Firestore, Timestamp, FieldPath } from 'firebase-admin/firestore';
 
 let app: App;
-let db: Firestore;
+let _db: Firestore;
 
 function getApp(): App {
   if (getApps().length === 0) {
@@ -23,12 +23,19 @@ function getApp(): App {
 }
 
 export function getDb(): Firestore {
-  if (!db) {
+  if (!_db) {
     getApp();
-    db = getFirestore();
+    _db = getFirestore();
   }
-  return db;
+  return _db;
 }
+
+// Lazy proxy so files importing `db` get a working Firestore instance
+export const db: Firestore = new Proxy({} as Firestore, {
+  get(_target, prop) {
+    return (getDb() as any)[prop];
+  },
+});
 
 // Collection names
 export const COLLECTIONS = {

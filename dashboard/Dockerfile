@@ -8,8 +8,8 @@ RUN yarn install --frozen-lockfile || yarn install
 COPY . .
 
 # Build args for env vars needed at build time
-ARG NEXTAUTH_URL
-ENV NEXTAUTH_URL=${NEXTAUTH_URL}
+# Use a valid placeholder; actual URL set via Cloud Run env vars at runtime
+ENV NEXTAUTH_URL=http://localhost:3000
 
 RUN yarn build
 
