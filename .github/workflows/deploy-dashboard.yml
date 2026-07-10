@@ -1,0 +1,38 @@
+name: Deploy Dashboard
+
+on:
+  push:
+    branches: [main]
+    paths: ['dashboard/**']
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: formclaw-dashboard
+          source: ./dashboard
+          region: us-central1
+          flags: |
+            --memory=512Mi
+            --cpu=1
+            --min-instances=0
+            --max-instances=2
+            --allow-unauthenticated
