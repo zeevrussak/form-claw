@@ -2,11 +2,12 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# System deps for ReportLab (Cairo) + pdf2image (poppler)
+# System deps for ReportLab (Cairo) + pdf2image (poppler) + HEIC (libheif)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 libpango-1.0-0 libpangocairo-1.0-0 \
     poppler-utils \
     fonts-noto-cjk \
+    libheif-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

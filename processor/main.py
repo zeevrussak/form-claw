@@ -27,12 +27,24 @@ from PIL import Image
 from security_filter import scan_email_content
 from form_filler import execute_fill_code
 
+# Supported image extensions
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.heic'}
+IMAGE_MIMES = {'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'}
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Form Claw Processor", version="1.0.0")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("formclaw")
+
+# Register HEIC/HEIF support with Pillow
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    log.info("HEIC/HEIF support registered")
+except ImportError:
+    log.warning("pillow-heif not installed — HEIC images won't be supported")
 
 db = firestore.Client()
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
@@ -125,19 +137,35 @@ async def process_form(request: Request):
         if verdict.blocked:
             raise ValueError(f"Security filter blocked: {verdict.summary}")
 
-        # ----- Extract PDF -----
+        # ----- Extract attachments (PDF or images) -----
         attachments = payload.get("attachments", [])
-        pdf_attachments = [
-            a for a in attachments
-            if a.get("mimeType", "") == "application/pdf"
-            or a.get("filename", "").lower().endswith(".pdf")
-        ]
-        if not pdf_attachments:
-            raise ValueError("No PDF attachments found")
+        pdf_attachments = [a for a in attachments if is_pdf_attachment(a)]
+        image_attachments = [a for a in attachments if is_image_attachment(a)]
 
-        pdf_data = base64.b64decode(pdf_attachments[0]["contentBase64"])
-        pdf_filename = pdf_attachments[0].get("filename", "form.pdf")
-        log.info(f"PDF: {pdf_filename} ({len(pdf_data)} bytes)")
+        if not pdf_attachments and not image_attachments:
+            raise ValueError("No PDF or image attachments found")
+
+        converted_from_images = False
+        if pdf_attachments:
+            # Use the first PDF
+            pdf_data = base64.b64decode(pdf_attachments[0]["contentBase64"])
+            pdf_filename = pdf_attachments[0].get("filename", "form.pdf")
+            log.info(f"PDF: {pdf_filename} ({len(pdf_data)} bytes)")
+        else:
+            # Convert images to PDF
+            log.info(f"No PDF found. Converting {len(image_attachments)} image(s) to PDF...")
+            image_bytes_list = [
+                base64.b64decode(a["contentBase64"]) for a in image_attachments
+            ]
+            pdf_data = images_to_pdf(image_bytes_list)
+            # Name the output after the first image
+            first_name = image_attachments[0].get("filename", "form")
+            base_name = os.path.splitext(first_name)[0]
+            pdf_filename = f"{base_name}.pdf"
+            converted_from_images = True
+            log.info(f"Converted to PDF: {pdf_filename} ({len(pdf_data)} bytes, {len(image_attachments)} image(s))")
+
+        source_type = "image" if converted_from_images else "pdf"
 
         # ----- Convert PDF pages to images -----
         page_images = pdf_to_images(pdf_data)
@@ -187,7 +215,10 @@ async def process_form(request: Request):
             "processing_status": "success",
             "target_person": target_person,
             "attachment_filename": pdf_filename,
-            "attachment_count": len(pdf_attachments),
+            "attachment_count": len(pdf_attachments) + len(image_attachments),
+            "source_type": source_type,
+            "converted_from_images": converted_from_images,
+            "image_count": len(image_attachments) if converted_from_images else 0,
             "page_count": len(page_images),
             "filled_pdf_path": blob_name,
             "processing_time_seconds": round(elapsed, 2),
@@ -274,7 +305,7 @@ async def _handle_intake_drop(payload: dict):
         f"Your email was received but could not be processed:\n\n"
         f"{reason}\n"
         f"{att_detail}\n\n"
-        f"Please resend with a PDF form attached and I'll fill it out for you.\n\n"
+        f"Please resend with a PDF form or image (JPG, PNG, WEBP, HEIC) attached and I'll fill it out for you.\n\n"
         f"— Form Claw Bot"
     )
 
@@ -296,6 +327,52 @@ async def _handle_intake_drop(payload: dict):
         log.error(f"Failed to send drop notification: {e}")
 
     return {"status": "dropped", "id": log_ref.id, "reason": reason}
+
+
+# ---------------------------------------------------------------------------
+# Image → PDF conversion
+# ---------------------------------------------------------------------------
+def is_image_attachment(att: dict) -> bool:
+    """Check if attachment is a supported image type."""
+    mime = att.get("mimeType", "").lower()
+    fname = att.get("filename", "").lower()
+    ext = os.path.splitext(fname)[1]
+    return mime in IMAGE_MIMES or ext in IMAGE_EXTENSIONS or att.get("kind") == "image"
+
+
+def is_pdf_attachment(att: dict) -> bool:
+    """Check if attachment is a PDF."""
+    mime = att.get("mimeType", "").lower()
+    fname = att.get("filename", "").lower()
+    return mime == "application/pdf" or fname.endswith(".pdf") or att.get("kind") == "pdf"
+
+
+def images_to_pdf(image_bytes_list: list[bytes]) -> bytes:
+    """
+    Convert one or more images to a single PDF.
+    Each image becomes one page, sized to fit the image at 72 DPI.
+    """
+    pil_images = []
+    for img_bytes in image_bytes_list:
+        img = Image.open(io.BytesIO(img_bytes))
+        # Convert to RGB if needed (HEIC may be RGBA, PNG may be P/RGBA)
+        if img.mode not in ('RGB', 'L'):
+            img = img.convert('RGB')
+        pil_images.append(img)
+
+    if not pil_images:
+        raise ValueError("No images to convert")
+
+    # Save as multi-page PDF
+    buf = io.BytesIO()
+    if len(pil_images) == 1:
+        pil_images[0].save(buf, format="PDF", resolution=72)
+    else:
+        pil_images[0].save(
+            buf, format="PDF", resolution=72,
+            save_all=True, append_images=pil_images[1:]
+        )
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------

@@ -5,9 +5,9 @@
  * parses MIME, validates sender whitelist, and forwards
  * the parsed email data to the Form Filler Bot webhook.
  *
- * If a whitelisted sender's email can't be processed (no PDFs),
- * it reports the event to the processor for logging + sends an
- * error notification.
+ * Supports PDF and image (jpg, png, jpeg, webp, heic) attachments.
+ * If a whitelisted sender's email has no supported attachments,
+ * it reports the event for logging and sends an error reply.
  */
 
 import PostalMime from 'postal-mime';
@@ -18,18 +18,29 @@ export interface Env {
   WHITELISTED_SENDERS: string;
 }
 
+const PDF_EXTENSIONS = ['.pdf'];
+const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.heic'];
+const IMAGE_MIME_PREFIXES = ['image/'];
+const PDF_MIMES = ['application/pdf'];
+
 /**
- * Detect if an attachment is a PDF — checks MIME type AND filename extension.
- * Outlook/Exchange often send PDFs as application/octet-stream.
+ * Classify an attachment as 'pdf', 'image', or 'other'.
  */
-function isPdfAttachment(att: { filename?: string; mimeType?: string }): boolean {
+function classifyAttachment(att: { filename?: string; mimeType?: string }): 'pdf' | 'image' | 'other' {
   const mime = (att.mimeType || '').toLowerCase();
   const name = (att.filename || '').toLowerCase();
-  return (
-    mime === 'application/pdf' ||
-    name.endsWith('.pdf') ||
-    (mime === 'application/octet-stream' && name.endsWith('.pdf'))
-  );
+
+  // PDF check
+  if (mime === 'application/pdf' || name.endsWith('.pdf')) return 'pdf';
+  // Also catch octet-stream PDFs
+  if (mime === 'application/octet-stream' && name.endsWith('.pdf')) return 'pdf';
+
+  // Image check by MIME
+  if (IMAGE_MIME_PREFIXES.some(p => mime.startsWith(p))) return 'image';
+  // Image check by extension (some clients send as octet-stream)
+  if (IMAGE_EXTENSIONS.some(ext => name.endsWith(ext))) return 'image';
+
+  return 'other';
 }
 
 function buildHeaders(env: Env): Record<string, string> {
@@ -69,41 +80,42 @@ export default {
     const parser = new PostalMime();
     const parsed = await parser.parse(rawUint8);
 
-    // Extract ALL attachments with metadata
-    const allAttachments = (parsed.attachments || []).map(att => ({
-      filename: att.filename || 'unnamed',
-      mimeType: att.mimeType || 'application/octet-stream',
-      size: att.content.byteLength,
-      isPdf: isPdfAttachment({ filename: att.filename, mimeType: att.mimeType }),
-    }));
+    // Classify ALL attachments
+    const allAttachments = (parsed.attachments || []).map(att => {
+      const kind = classifyAttachment({ filename: att.filename, mimeType: att.mimeType });
+      const meta = {
+        filename: att.filename || 'unnamed',
+        mimeType: att.mimeType || 'application/octet-stream',
+        size: att.content.byteLength,
+        kind,
+      };
+      console.log(`[Form Claw] Attachment: ${meta.filename} (${meta.mimeType}, ${meta.size} bytes, kind=${kind})`);
+      return meta;
+    });
 
-    for (const a of allAttachments) {
-      console.log(`[Form Claw] Attachment: ${a.filename} (${a.mimeType}, ${a.size} bytes, isPdf=${a.isPdf})`);
-    }
+    // Separate PDFs and images
+    const pdfIndices = allAttachments.map((a, i) => a.kind === 'pdf' ? i : -1).filter(i => i >= 0);
+    const imageIndices = allAttachments.map((a, i) => a.kind === 'image' ? i : -1).filter(i => i >= 0);
 
-    // Find PDF attachments
-    const pdfIndices = allAttachments
-      .map((a, i) => a.isPdf ? i : -1)
-      .filter(i => i >= 0);
+    const hasSupportedAttachments = pdfIndices.length > 0 || imageIndices.length > 0;
 
     const attachmentSummary = allAttachments.map(a => ({
       filename: a.filename,
       mimeType: a.mimeType,
       size: a.size,
-      isPdf: a.isPdf,
+      kind: a.kind,
     }));
 
-    if (pdfIndices.length === 0) {
-      // No PDFs found — report to processor for logging and error notification
-      console.log(`[Form Claw] No PDF attachments found in ${allAttachments.length} total attachments — reporting to processor`);
-      console.log(`[Form Claw] Attachment types: ${allAttachments.map(a => `${a.filename}:${a.mimeType}`).join(', ')}`);
+    if (!hasSupportedAttachments) {
+      // No processable attachments — report drop
+      console.log(`[Form Claw] No PDF or image attachments found in ${allAttachments.length} total — reporting to processor`);
 
       const dropPayload = {
         source: 'cloudflare_email',
         type: 'intake_drop',
         reason: allAttachments.length === 0
           ? 'No attachments found in the email'
-          : `No PDF attachments found. Received ${allAttachments.length} attachment(s): ${allAttachments.map(a => `${a.filename} (${a.mimeType})`).join(', ')}`,
+          : `No supported attachments found. Accepted types: PDF, JPG, PNG, WEBP, HEIC. Received ${allAttachments.length} attachment(s): ${allAttachments.map(a => `${a.filename} (${a.mimeType})`).join(', ')}`,
         from,
         to,
         subject,
@@ -127,14 +139,20 @@ export default {
       return;
     }
 
-    // Base64-encode PDFs
-    const pdfAttachments = pdfIndices.map(idx => {
+    // Base64-encode supported attachments
+    const supportedAttachments = [...pdfIndices, ...imageIndices].map(idx => {
       const att = parsed.attachments![idx];
       const meta = allAttachments[idx];
+      // Normalize PDF MIME type
+      let mimeType = meta.mimeType;
+      if (meta.kind === 'pdf' && mimeType === 'application/octet-stream') {
+        mimeType = 'application/pdf';
+      }
       return {
         filename: meta.filename,
-        mimeType: meta.mimeType === 'application/octet-stream' ? 'application/pdf' : meta.mimeType,
+        mimeType,
         size: meta.size,
+        kind: meta.kind,
         contentBase64: arrayBufferToBase64(att.content),
       };
     });
@@ -150,13 +168,13 @@ export default {
       references: message.headers.get('references') || '',
       textBody: parsed.text || '',
       htmlBody: parsed.html || '',
-      attachments: pdfAttachments,
+      attachments: supportedAttachments,
       allAttachmentCount: allAttachments.length,
       attachmentSummary,
       receivedAt: new Date().toISOString(),
     };
 
-    console.log(`[Form Claw] Forwarding ${pdfAttachments.length} PDF(s) to webhook`);
+    console.log(`[Form Claw] Forwarding ${pdfIndices.length} PDF(s) + ${imageIndices.length} image(s) to webhook`);
 
     try {
       const resp = await fetch(env.WEBHOOK_URL, {
