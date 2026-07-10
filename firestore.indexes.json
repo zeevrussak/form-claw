@@ -1,0 +1,38 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "form_processing_logs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "processing_status", "order": "ASCENDING" },
+        { "fieldPath": "received_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "form_processing_logs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "sender_email", "order": "ASCENDING" },
+        { "fieldPath": "received_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "knowledge_entries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "is_active", "order": "ASCENDING" },
+        { "fieldPath": "category", "order": "ASCENDING" },
+        { "fieldPath": "key", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "knowledge_entries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "is_active", "order": "ASCENDING" },
+        { "fieldPath": "applies_to_person", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

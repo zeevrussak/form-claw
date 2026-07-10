@@ -1,0 +1,9 @@
+name = "form-claw-email"
+main = "src/index.ts"
+compatibility_date = "2024-09-25"
+
+[vars]
+# The webhook URL for the form processor daemon
+WEBHOOK_URL = "https://apps.abacus.ai/api/webhooks?abacus_deployment_token=MTMxODA3ODA6MTM5NjI1OTA6NTMyMTA6ZA.bd451fc3e446486225da48634634cd0c&v=1"
+# Comma-separated whitelisted senders
+WHITELISTED_SENDERS = "k6622024@gmail.com,targetmailbox@gmail.com,2396119@gmail.com,zeev@infiniplex.life"

@@ -1,0 +1,17 @@
+{
+  "name": "form-claw-email-worker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241018.0",
+    "wrangler": "^3.80.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "postal-mime": "^2.3.2"
+  }
+}

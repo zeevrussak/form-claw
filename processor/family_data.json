@@ -1,0 +1,183 @@
+{
+    "family_name": {
+        "english": "Russak",
+        "hebrew": "רוסק"
+    },
+    "address": {
+        "english": "Ofra Haza 1, Raanana 4334801, ISRAEL",
+        "hebrew": "עפרה חזה 1 רעננה 4334801 ישראל",
+        "street_english": "Ofra Haza 1",
+        "street_hebrew": "עפרה חזה 1",
+        "city_english": "Raanana",
+        "city_hebrew": "רעננה",
+        "zip": "4334801",
+        "country_english": "ISRAEL",
+        "country_hebrew": "ישראל"
+    },
+    "father": {
+        "first_name_english": "Ze'ev",
+        "first_name_hebrew": "זאב",
+        "last_name_english": "Russak",
+        "last_name_hebrew": "רוסק",
+        "full_name_english": "Ze'ev Russak",
+        "full_name_hebrew": "זאב רוסק",
+        "id": "034954990",
+        "birth_date": "26-08-1979",
+        "birth_date_iso": "1979-08-26",
+        "phone": "054-2396119",
+        "email": "2396119@gmail.com",
+        "signature_path": "/home/ubuntu/shared/zr signature nxp.png",
+        "role": "father",
+        "phone_type": "mobile"
+    },
+    "mother": {
+        "first_name_english": "Keren",
+        "first_name_hebrew": "קרן",
+        "last_name_english": "Russak",
+        "last_name_hebrew": "רוסק",
+        "full_name_english": "Keren Russak",
+        "full_name_hebrew": "קרן רוסק",
+        "id": "021973706",
+        "birth_date": "18-09-1986",
+        "birth_date_iso": "1986-09-18",
+        "phone": "055-6622024",
+        "email": "k6622024@gmail.com",
+        "signature_path": "/home/ubuntu/shared/keren sig.png",
+        "role": "mother",
+        "phone_type": "mobile"
+    },
+    "children": [
+        {
+            "first_name_english": "Savyon",
+            "first_name_hebrew": "סביון",
+            "last_name_english": "Russak",
+            "last_name_hebrew": "רוסק",
+            "full_name_english": "Savyon Russak",
+            "full_name_hebrew": "סביון רוסק",
+            "id": "222769127",
+            "birth_date": "20-03-2014",
+            "birth_date_iso": "2014-03-20",
+            "school_hebrew": "תל\"י",
+            "school_english": "Tali Elementary School",
+            "school_city": "Raanana",
+            "school_city_hebrew": "רעננה",
+            "role": "daughter"
+        },
+        {
+            "first_name_english": "Clil",
+            "first_name_hebrew": "כליל",
+            "last_name_english": "Russak",
+            "last_name_hebrew": "רוסק",
+            "full_name_english": "Clil Russak",
+            "full_name_hebrew": "כליל רוסק",
+            "id": "222769119",
+            "birth_date": "20-03-2014",
+            "birth_date_iso": "2014-03-20",
+            "school_hebrew": "בן גוריון",
+            "school_english": "Ben Gurion Elementary School",
+            "school_city": "Kfar Saba",
+            "school_city_hebrew": "כפר סבא",
+            "grade": "6",
+            "grade_hebrew": "ו'",
+            "email": "clil.russak@gmail.com",
+            "role": "daughter"
+        }
+    ],
+    "medical": {
+        "diagnosis": "ASD",
+        "diagnosis_hebrew": "הפרעה בספקטרום האוטיסטי",
+        "diagnosed_since": "2016",
+        "doctor": "Dr. Argaman",
+        "doctor_hebrew": "דוקטור ארגמן",
+        "institute_english": "Institute for Child Development, Netanya",
+        "institute_hebrew": "מכון להתפתחות הילד, נתניה",
+        "hmo": "Maccabi",
+        "hmo_hebrew": "מכבי",
+        "applies_to": [
+            "Savyon",
+            "Clil"
+        ]
+    },
+    "whitelist": [
+        "k6622024@gmail.com",
+        "targetmailbox@gmail.com",
+        "2396119@gmail.com",
+        "zeev@infiniplex.life"
+    ],
+    "error_log_email": "russakbot+log_formfill@gmail.com",
+    "date_format": "DD-MM-YYYY",
+    "instruction_parsing": {
+        "description": "The email subject and/or body may contain Hebrew or English instructions specifying WHO the form is FOR and WHO should SIGN it. These instructions OVERRIDE any auto-detection from form content.",
+        "examples": [
+            {
+                "text": "מלא את זה על ידי קרן בעבור סביון",
+                "meaning": "Fill this by Keren for Savyon",
+                "signer": "mother",
+                "target_child": "Savyon"
+            },
+            {
+                "text": "מלא על ידי זאב בשביל כליל",
+                "meaning": "Fill by Ze'ev for Clil",
+                "signer": "father",
+                "target_child": "Clil"
+            },
+            {
+                "text": "בשביל סביון",
+                "meaning": "For Savyon",
+                "target_child": "Savyon"
+            },
+            {
+                "text": "עבור כליל",
+                "meaning": "For Clil",
+                "target_child": "Clil"
+            }
+        ],
+        "signer_keywords": {
+            "mother_indicators_hebrew": [
+                "קרן",
+                "על ידי קרן",
+                "חתימת קרן",
+                "אמא",
+                "האם"
+            ],
+            "mother_indicators_english": [
+                "Keren",
+                "by Keren",
+                "mother",
+                "mom"
+            ],
+            "father_indicators_hebrew": [
+                "זאב",
+                "על ידי זאב",
+                "חתימת זאב",
+                "אבא",
+                "האב"
+            ],
+            "father_indicators_english": [
+                "Ze'ev",
+                "Zeev",
+                "by Ze'ev",
+                "father",
+                "dad"
+            ]
+        },
+        "target_keywords": {
+            "savyon_indicators": [
+                "סביון",
+                "Savyon",
+                "תלי",
+                "Tali"
+            ],
+            "clil_indicators": [
+                "כליל",
+                "Clil",
+                "בן גוריון",
+                "Ben Gurion",
+                "כפר סבא",
+                "Kfar Saba"
+            ]
+        }
+    },
+    "hmo": "Maccabi",
+    "hmo_hebrew": "מכבי"
+}
