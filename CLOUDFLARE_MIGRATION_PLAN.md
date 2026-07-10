@@ -1,8 +1,9 @@
-# Form Claw — Cloudflare Workers Migration Plan
+# Form Claw — Migration Plan
 
-**Date**: 2026-07-09  
+**Date**: 2026-07-10  
 **Author**: Form Claw Project  
-**Status**: DRAFT — awaiting review
+**Status**: DRAFT — awaiting review  
+**Selected Path**: Option 2 — All-Google (Google Cloud Run + Firestore + AI Studio)
 
 ---
 
@@ -1360,3 +1361,816 @@ For Phase 1-5, the existing REST endpoints on the Abacus dashboard are sufficien
 - 🔄 Code execution: Abacus agent Python sandbox → Self-hosted FastAPI on Proxmox
 - 🔄 Dashboard: Abacus-hosted → Self-hosted on Proxmox VM via Cloudflare Tunnel
 - 🔄 Analytics (future): REST → GraphQL on Cloudflare Worker
+
+---
+---
+
+# OPTION 2: All-Google Deployment (SELECTED)
+
+This section describes the **selected** deployment path: everything on Google Cloud, with Cloudflare only for DNS and email routing.
+
+---
+
+## G1. Architecture Overview
+
+```
+┌─────────────────┐    ┌──────────────────────┐
+│ Incoming Email   │───▶│ Cloudflare Worker     │
+│ formclaw@        │    │ (email → JSON + PDF   │
+│ savlil.com       │    │  base64 → POST to     │
+│                  │    │  Cloud Run webhook)   │
+│ via Cloudflare   │    │                       │
+│ Email Routing    │    │ STAYS ON CLOUDFLARE   │
+└─────────────────┘    └──────────────────────┘
+                                    │
+                    ┌──────────────▼───────────────────────────────────┐
+                    │        GOOGLE CLOUD (us-central1)                 │
+                    │                                                   │
+                    │  ┌───────────────────────┐  ┌─────────────────┐  │
+                    │  │ Cloud Run: Processor  │  │ Google AI Studio│  │
+                    │  │ (Python FastAPI)      │─▶│ Gemini 2.5 Flash│  │
+                    │  │  - Receive webhook    │  │ (free tier)     │  │
+                    │  │  - LLM vision analyze │  └─────────────────┘  │
+                    │  │  - Generate fill code  │                        │
+                    │  │  - Execute Python      │  ┌─────────────────┐  │
+                    │  │  - ReportLab + PyPDF2  │  │ Firestore       │  │
+                    │  │  - Reply via Resend   │─▶│ (free tier)     │  │
+                    │  └───────────────────────┘  │ - logs          │  │
+                    │                              │ - system_status │  │
+                    │  ┌───────────────────────┐  │ - knowledge     │  │
+                    │  │ Cloud Run: Dashboard  │─▶│ - app_config    │  │
+                    │  │ (Next.js SSR)         │  └─────────────────┘  │
+                    │  │  - formclaw.savlil.com │                        │
+                    │  │  - Auth (NextAuth.js)  │  ┌─────────────────┐  │
+                    │  │  - Stats, Logs, KB    │  │ Cloud Storage   │  │
+                    │  └───────────────────────┘  │ (free 5GB)      │  │
+                    │                              │ - signatures    │  │
+                    │                              │ - fonts         │  │
+                    │                              │ - filled PDFs   │  │
+                    │                              └─────────────────┘  │
+                    └─────────────────────────────────────────────────┘
+
+┌──────────────────────┐    ┌──────────────────────┐
+│ Cloudflare DNS       │    │ Resend API           │
+│ savlil.com           │    │ (reply with filled   │
+│ formclaw.savlil.com  │    │  PDF attached)       │
+│  → Cloud Run          │    └──────────────────────┘
+└──────────────────────┘
+```
+
+### Key differences from Option 1 (Cloudflare + Proxmox)
+
+| Aspect | Option 1 (CF + Proxmox) | Option 2 (All-Google) |
+|--------|------------------------|----------------------|
+| Form Processor | CF Worker + Proxmox Python API | Cloud Run (Python, full stack) |
+| Dashboard | Self-hosted on Proxmox LXC | Cloud Run (Next.js container) |
+| Database | Cloudflare D1 (SQLite) | Google Firestore (NoSQL) |
+| File Storage | Local disk on VM | Google Cloud Storage |
+| LLM | vLLM (self-hosted) + CF fallback | Google AI Studio (free tier) |
+| Uptime dependency | Your home internet + power | Google's SLA |
+| Cold starts | None (always running) | 1-5s after idle period |
+| Monthly cost | ~$3-8 (electricity) | **$0** |
+| Home server needed | Yes (Proxmox) | **No** |
+
+---
+
+## G2. Google Cloud Services & Free Tier Budget
+
+### Service breakdown at 2 forms/day (60/month)
+
+| Google Service | What it does | Free Tier Limit | Our Usage | Headroom |
+|---------------|-------------|----------------|-----------|----------|
+| **Cloud Run** (Processor) | Receives webhook, runs Python fill | 2M requests, 180K vCPU-sec | ~60 requests/mo, ~600 vCPU-sec | 99.7% free |
+| **Cloud Run** (Dashboard) | Next.js SSR dashboard | (shared with above) | ~500 page loads/mo | 99.9% free |
+| **Firestore** | Logs, config, knowledge base | 50K reads + 20K writes/day | ~200 reads + ~60 writes/day | 96% free |
+| **Cloud Storage** | Signatures, fonts, filled PDFs | 5 GB/mo | ~100 MB | 98% free |
+| **AI Studio** (Gemini 2.5 Flash) | Vision analysis + code gen | 1,500 RPD, 250K TPM | ~12 calls/day | 99.2% free |
+| **Artifact Registry** | Container images | 0.5 GB | ~400 MB (2 images) | ≈100% free |
+| **Secret Manager** | API keys, tokens | 6 active versions free | 5-6 secrets | ≈100% free |
+
+### Total monthly cost: **$0.00**
+
+No credit card required for AI Studio. Cloud Run + Firestore + GCS require a billing account but will stay within free tier.
+
+---
+
+## G3. Form Processor — Cloud Run (Python)
+
+Unlike Option 1 (which splits orchestration into a CF Worker + a Python API on your home VM), the all-Google approach runs **everything in a single Python Cloud Run service**. This is simpler: one container does LLM calls, Python code execution, PDF filling, and Resend reply.
+
+### Why Python on Cloud Run (not a CF Worker + VM)
+
+- **ReportLab + PyPDF2 run natively** — no need for a separate sandbox
+- **No home server dependency** — 100% uptime independent of your ISP
+- **Single codebase** — no orchestrator/worker split
+- **60-minute timeout** — enough for complex multi-page forms
+- **Scales to zero** — no cost when idle
+
+### Container structure
+
+```dockerfile
+# Dockerfile.processor
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# System deps for ReportLab
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libcairo2 libpango-1.0-0 libpangocairo-1.0-0 fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+```
+
+```
+# requirements.txt
+fastapi>=0.115
+uvicorn[standard]
+reportlab>=4.2
+PyPDF2>=3.0
+Pillow>=10.0
+google-cloud-firestore>=2.18
+google-cloud-storage>=2.18
+httpx
+resend
+```
+
+### Main application
+
+```python
+# main.py
+import os
+import json
+import base64
+import httpx
+import resend
+from fastapi import FastAPI, Request, HTTPException
+from google.cloud import firestore, storage
+from datetime import datetime, timezone
+
+app = FastAPI()
+db = firestore.Client()
+bucket = storage.Client().bucket(os.environ["GCS_BUCKET"])
+resend.api_key = os.environ["RESEND_API_KEY"]
+
+GEMINI_API_KEY = os.environ["GOOGLE_AI_STUDIO_KEY"]
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+
+
+@app.post("/webhook")
+async def process_form(request: Request):
+    """Receive email payload from Cloudflare Email Worker."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if token != os.environ["WEBHOOK_SECRET"]:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    payload = await request.json()
+    log_ref = db.collection("form_processing_logs").document()
+
+    try:
+        # 1. Extract PDF from email
+        pdf_bytes = base64.b64decode(payload["attachments"][0]["content"])
+
+        # 2. Convert PDF pages to images (using PyPDF2 + Pillow)
+        page_images = convert_pdf_to_images(pdf_bytes)
+
+        # 3. Call Gemini 2.5 Flash for vision analysis
+        analysis = await analyze_form_with_gemini(page_images, payload.get("subject", ""))
+
+        # 4. Generate and execute fill code
+        filled_pdf = await generate_and_execute_fill(pdf_bytes, analysis)
+
+        # 5. Upload filled PDF to Cloud Storage
+        blob_name = f"filled/{log_ref.id}.pdf"
+        blob = bucket.blob(blob_name)
+        blob.upload_from_string(filled_pdf, content_type="application/pdf")
+
+        # 6. Reply via Resend
+        resend.Emails.send({
+            "from": "Form Claw <formclaw@savlil.com>",
+            "to": [payload["from"]],
+            "subject": f"Re: {payload['subject']}",
+            "text": "Filled form attached.",
+            "attachments": [{
+                "filename": "filled_form.pdf",
+                "content": base64.b64encode(filled_pdf).decode()
+            }]
+        })
+
+        # 7. Log success
+        log_ref.set({
+            "received_at": datetime.now(timezone.utc),
+            "sender_email": payload["from"],
+            "subject": payload["subject"],
+            "processing_status": "success",
+            "target_person": analysis.get("target_person", "unknown"),
+            "filled_pdf_path": blob_name,
+            "llm_provider": "google/gemini-2.5-flash",
+            "processing_time_seconds": (datetime.now(timezone.utc) - log_ref.create_time).total_seconds() if log_ref.create_time else 0
+        })
+
+        return {"status": "success", "id": log_ref.id}
+
+    except Exception as e:
+        log_ref.set({
+            "received_at": datetime.now(timezone.utc),
+            "sender_email": payload.get("from", "unknown"),
+            "subject": payload.get("subject", ""),
+            "processing_status": "failed",
+            "error_message": str(e),
+            "error_type": type(e).__name__
+        })
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def analyze_form_with_gemini(page_images: list[bytes], subject: str) -> dict:
+    """Send PDF page images to Gemini 2.5 Flash for field analysis."""
+    image_parts = [
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64.b64encode(img).decode()}"}}
+        for img in page_images
+    ]
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            GEMINI_URL,
+            headers={"Authorization": f"Bearer {GEMINI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "gemini-2.5-flash",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Analyze this Hebrew PDF form. Subject hint: {subject}. ..."},
+                        *image_parts
+                    ]
+                }]
+            }
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+```
+
+### Deploy command
+
+```bash
+# One-time setup
+gcloud auth login
+gcloud config set project formclaw
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com
+
+# Deploy
+gcloud run deploy formclaw-processor \
+  --source . \
+  --region us-central1 \
+  --memory 1Gi \
+  --cpu 1 \
+  --timeout 300 \
+  --min-instances 0 \
+  --max-instances 3 \
+  --set-secrets "GOOGLE_AI_STUDIO_KEY=google-ai-studio-key:latest,RESEND_API_KEY=resend-key:latest,WEBHOOK_SECRET=webhook-secret:latest" \
+  --set-env-vars "GCS_BUCKET=formclaw-assets" \
+  --allow-unauthenticated
+```
+
+---
+
+## G4. Dashboard — Cloud Run (Next.js)
+
+The existing Next.js dashboard runs as a second Cloud Run service. The main change is replacing Prisma/PostgreSQL with the Firestore SDK.
+
+### Database migration: Prisma → Firestore
+
+Firestore is a NoSQL document database. The mapping from current Prisma models:
+
+| Prisma Model | Firestore Collection | Key Fields |
+|-------------|---------------------|------------|
+| `formProcessingLog` | `form_processing_logs` | receivedAt, senderEmail, status, targetPerson, processingTime |
+| `systemStatus` | `system_status` (single doc) | webhookEnabled, emailSource, lastCloudflareEmail |
+| `knowledgeEntry` | `knowledge_entries` | key, value, category, appliesToPerson, isActive |
+| `appConfig` | `app_config` | key, value, label, category |
+| `User` | `users` | email, name, role, hashedPassword |
+
+### Example: API route migration
+
+**Before (Prisma/PostgreSQL)**:
+```typescript
+const logs = await prisma.formProcessingLog.findMany({
+  where: { processing_status: 'success' },
+  orderBy: { received_at: 'desc' },
+  take: 10
+});
+```
+
+**After (Firestore)**:
+```typescript
+import { getFirestore } from 'firebase-admin/firestore';
+
+const db = getFirestore();
+const snapshot = await db.collection('form_processing_logs')
+  .where('processing_status', '==', 'success')
+  .orderBy('received_at', 'desc')
+  .limit(10)
+  .get();
+
+const logs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+```
+
+### Container
+
+```dockerfile
+# Dockerfile.dashboard
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package.json yarn.lock ./
+RUN yarn install --frozen-lockfile
+COPY . .
+RUN yarn build
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+
+ENV PORT=8080
+ENV NODE_ENV=production
+CMD ["node", "server.js"]
+```
+
+### Deploy command
+
+```bash
+gcloud run deploy formclaw-dashboard \
+  --source . \
+  --region us-central1 \
+  --memory 512Mi \
+  --cpu 1 \
+  --min-instances 0 \
+  --max-instances 2 \
+  --set-secrets "NEXTAUTH_SECRET=nextauth-secret:latest" \
+  --set-env-vars "NEXTAUTH_URL=https://formclaw.savlil.com" \
+  --allow-unauthenticated
+```
+
+---
+
+## G5. Firestore Schema Design
+
+### Collections
+
+```
+formclaw-db/
+├── form_processing_logs/          # One doc per processed email
+│   └── {auto-id}
+│       ├── received_at: Timestamp
+│       ├── sender_email: string
+│       ├── sender_name: string
+│       ├── subject: string
+│       ├── processing_status: "success" | "failed"
+│       ├── target_person: string
+│       ├── filled_pdf_path: string     # GCS path
+│       ├── original_pdf_path: string
+│       ├── error_message: string?
+│       ├── error_type: string?
+│       ├── llm_provider: string
+│       ├── processing_time_seconds: number
+│       └── fields_filled: number
+│
+├── knowledge_entries/             # Family data for form filling
+│   └── {auto-id}
+│       ├── key: string
+│       ├── value: string
+│       ├── category: string            # "personal_info", "medical", "address", etc.
+│       ├── applies_to_person: string   # "Savyon", "Clil", "Family-wide"
+│       ├── language: string            # "he", "en", "both"
+│       ├── source: string
+│       ├── is_active: boolean
+│       └── updated_at: Timestamp
+│
+├── app_config/                    # Key-value settings
+│   └── {key-as-doc-id}              # e.g., "font_english", "font_hebrew"
+│       ├── value: string
+│       ├── label: string?
+│       ├── category: string?           # "fonts"
+│       └── updated_at: Timestamp
+│
+├── system_status/                 # Single document
+│   └── current
+│       ├── webhook_enabled: boolean
+│       ├── email_source: "cloudflare"
+│       ├── last_cloudflare_email: Timestamp?
+│       └── updated_at: Timestamp
+│
+└── users/                         # Auth users
+    └── {auto-id}
+        ├── email: string
+        ├── name: string?
+        ├── role: "admin"
+        ├── hashed_password: string
+        └── created_at: Timestamp
+```
+
+### Firestore indexes needed
+
+```
+# firestore.indexes.json
+{
+  "indexes": [
+    {
+      "collectionGroup": "form_processing_logs",
+      "fields": [
+        { "fieldPath": "processing_status", "order": "ASCENDING" },
+        { "fieldPath": "received_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "form_processing_logs",
+      "fields": [
+        { "fieldPath": "sender_email", "order": "ASCENDING" },
+        { "fieldPath": "received_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "knowledge_entries",
+      "fields": [
+        { "fieldPath": "is_active", "order": "ASCENDING" },
+        { "fieldPath": "category", "order": "ASCENDING" },
+        { "fieldPath": "key", "order": "ASCENDING" }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+## G6. Cloud Storage Layout
+
+```
+gs://formclaw-assets/
+├── signatures/
+│   ├── zeev_signature.png         # Transparent PNG
+│   └── keren_signature.png
+├── fonts/
+│   ├── FtPilKahol2.ttf            # Hebrew font
+│   └── Playzone.ttf               # English font
+├── originals/                     # Incoming PDFs (optional archive)
+│   └── {log-id}_original.pdf
+└── filled/                        # Output filled PDFs
+    └── {log-id}.pdf
+```
+
+**Bucket setup:**
+```bash
+# Create bucket in us-central1 (free tier region)
+gsutil mb -l us-central1 gs://formclaw-assets
+
+# Upload static assets
+gsutil cp signatures/*.png gs://formclaw-assets/signatures/
+gsutil cp fonts/*.ttf gs://formclaw-assets/fonts/
+```
+
+---
+
+## G7. Cloudflare DNS → Cloud Run Routing
+
+Cloudflare manages DNS for `savlil.com`. Point your subdomain to Cloud Run:
+
+### Option A: Direct CNAME (simpler)
+
+1. In Cloud Run, map custom domain:
+   ```bash
+   gcloud run domain-mappings create \
+     --service formclaw-dashboard \
+     --domain formclaw.savlil.com \
+     --region us-central1
+   ```
+
+2. In Cloudflare DNS, add:
+   ```
+   Type: CNAME
+   Name: formclaw
+   Target: ghs.googlehosted.com
+   Proxy: DNS only (gray cloud) — required for Google to issue TLS cert
+   ```
+
+3. Google will auto-provision a managed SSL certificate.
+
+### Option B: Cloudflare proxy (orange cloud)
+
+If you want Cloudflare's WAF/caching in front of Cloud Run:
+
+1. Use Cloud Run's auto-generated `*.run.app` URL
+2. In Cloudflare, set up a **proxied CNAME** (orange cloud) pointing to the `.run.app` URL
+3. Enable "Full (Strict)" SSL mode in Cloudflare
+4. This gives you Cloudflare CDN + DDoS protection + Cloud Run backend
+
+**Recommendation**: Start with Option A (simpler). Add Cloudflare proxy later if needed.
+
+### Processor webhook URL
+
+The Cloudflare Email Worker needs to POST to the processor. Update the worker's environment:
+
+```toml
+# wrangler.toml (email worker)
+[vars]
+WEBHOOK_URL = "https://formclaw-processor-XXXXX-uc.a.run.app/webhook"
+# or use a subdomain: https://api.formclaw.savlil.com/webhook
+```
+
+---
+
+## G8. Secrets Management
+
+### Google Secret Manager
+
+```bash
+# Create secrets
+echo -n "your-ai-studio-key" | gcloud secrets create google-ai-studio-key --data-file=-
+echo -n "your-resend-key"    | gcloud secrets create resend-key --data-file=-
+echo -n "your-webhook-token" | gcloud secrets create webhook-secret --data-file=-
+echo -n "your-nextauth-sec"  | gcloud secrets create nextauth-secret --data-file=-
+
+# Grant Cloud Run access
+gcloud secrets add-iam-policy-binding google-ai-studio-key \
+  --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+# Repeat for each secret
+```
+
+### Complete secrets inventory
+
+| Secret | Used by | Source |
+|--------|---------|--------|
+| `google-ai-studio-key` | Processor | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| `resend-key` | Processor | [resend.com/api-keys](https://resend.com/api-keys) |
+| `webhook-secret` | Email Worker + Processor | `openssl rand -hex 32` |
+| `nextauth-secret` | Dashboard | `openssl rand -hex 32` |
+
+---
+
+## G9. CI/CD via GitHub Actions
+
+### Repository structure
+
+```
+form-claw/
+├── processor/                 # Cloud Run: Python form processor
+│   ├── Dockerfile
+│   ├── main.py
+│   ├── requirements.txt
+│   ├── form_filler.py
+│   ├── security_filter.py
+│   └── family_data.json
+├── dashboard/                 # Cloud Run: Next.js dashboard
+│   ├── Dockerfile
+│   ├── app/
+│   ├── components/
+│   ├── lib/
+│   └── package.json
+├── email-worker/              # Cloudflare Worker (stays on CF)
+│   ├── src/index.ts
+│   └── wrangler.toml
+├── firestore.indexes.json
+├── firestore.rules
+└── .github/workflows/
+    ├── deploy-processor.yml
+    ├── deploy-dashboard.yml
+    └── deploy-email-worker.yml
+```
+
+### GitHub Actions: Deploy Processor
+
+```yaml
+# .github/workflows/deploy-processor.yml
+name: Deploy Form Processor
+on:
+  push:
+    branches: [main]
+    paths: ['processor/**']
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: formclaw-processor
+          source: ./processor
+          region: us-central1
+```
+
+### GitHub Actions: Deploy Dashboard
+
+```yaml
+# .github/workflows/deploy-dashboard.yml
+name: Deploy Dashboard
+on:
+  push:
+    branches: [main]
+    paths: ['dashboard/**']
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: formclaw-dashboard
+          source: ./dashboard
+          region: us-central1
+```
+
+### GitHub secrets needed
+
+| Secret | Purpose |
+|--------|--------|
+| `WIF_PROVIDER` | Workload Identity Federation provider (keyless auth) |
+| `GCP_SERVICE_ACCOUNT` | Service account email for deployments |
+| `CLOUDFLARE_API_TOKEN` | For email worker deploys |
+
+---
+
+## G10. Migration from Current Prisma/PostgreSQL
+
+### Data export script
+
+```python
+# migrate_to_firestore.py
+"""One-time migration: PostgreSQL → Firestore."""
+import psycopg2
+from google.cloud import firestore
+import os
+
+# Connect to source (current Abacus PostgreSQL)
+pg = psycopg2.connect(os.environ["DATABASE_URL"])
+db = firestore.Client()
+
+def migrate_logs():
+    cur = pg.cursor()
+    cur.execute("SELECT * FROM form_processing_log ORDER BY received_at")
+    cols = [desc[0] for desc in cur.description]
+    batch = db.batch()
+    count = 0
+    for row in cur:
+        doc = dict(zip(cols, row))
+        ref = db.collection("form_processing_logs").document()
+        batch.set(ref, doc)
+        count += 1
+        if count % 500 == 0:  # Firestore batch limit
+            batch.commit()
+            batch = db.batch()
+    batch.commit()
+    print(f"Migrated {count} logs")
+
+def migrate_knowledge():
+    cur = pg.cursor()
+    cur.execute("SELECT * FROM knowledge_entry WHERE is_active = true")
+    cols = [desc[0] for desc in cur.description]
+    batch = db.batch()
+    count = 0
+    for row in cur:
+        doc = dict(zip(cols, row))
+        ref = db.collection("knowledge_entries").document()
+        batch.set(ref, doc)
+        count += 1
+        if count % 500 == 0:
+            batch.commit()
+            batch = db.batch()
+    batch.commit()
+    print(f"Migrated {count} knowledge entries")
+
+def migrate_config():
+    cur = pg.cursor()
+    cur.execute("SELECT key, value, label, category FROM app_config")
+    for row in cur:
+        db.collection("app_config").document(row[0]).set({
+            "value": row[1], "label": row[2], "category": row[3]
+        })
+    print("Migrated app_config")
+
+if __name__ == "__main__":
+    migrate_logs()
+    migrate_knowledge()
+    migrate_config()
+    pg.close()
+```
+
+---
+
+## G11. Cold Starts & Performance
+
+Cloud Run scales to zero. After idle periods, the first request triggers a cold start:
+
+| Service | Expected Cold Start | Impact | Mitigation |
+|---------|-------------------|--------|------------|
+| Processor (Python) | 3-5 seconds | First form after idle takes longer | Acceptable — email processing isn't real-time |
+| Dashboard (Next.js) | 1-3 seconds | First page load after idle is slower | Set `min-instances: 1` if annoying (~$5/mo) |
+
+For 2 forms/day, cold starts will happen on nearly every request. This is fine for the processor (email → reply latency isn't critical). For the dashboard, you'll notice a brief delay on first load.
+
+**If cold starts bother you later**: set `--min-instances 1` on the dashboard only. Cost: ~$5/month.
+
+---
+
+## G12. Implementation Phases (All-Google)
+
+| Phase | Tasks | Duration |
+|-------|-------|----------|
+| **1. GCP Setup** | Create project, enable APIs, create Firestore DB, GCS bucket, Secret Manager entries | 1 day |
+| **2. Processor** | Port form filler to standalone Python FastAPI, integrate Gemini API, containerize, deploy to Cloud Run | 2-3 days |
+| **3. Email Worker Update** | Update Cloudflare Email Worker to POST to Cloud Run URL instead of Abacus webhook | 30 min |
+| **4. Data Migration** | Export PostgreSQL → Firestore, verify data integrity | 1 day |
+| **5. Dashboard** | Replace Prisma with Firestore SDK, rebuild API routes, containerize, deploy, DNS setup | 2-3 days |
+| **6. CI/CD** | Set up GitHub Actions, Workload Identity Federation, test push-to-deploy | 1 day |
+| **7. Cutover** | Point DNS, test end-to-end, decommission Abacus resources | 1 day |
+
+**Total: 8-10 days**
+
+---
+
+## G13. Cost Summary (All-Google)
+
+| Component | Monthly Cost |
+|-----------|-------------|
+| Cloud Run (Processor + Dashboard) | $0 (free tier) |
+| Firestore | $0 (free tier) |
+| Cloud Storage | $0 (free tier) |
+| Google AI Studio (Gemini 2.5 Flash) | $0 (free tier) |
+| Artifact Registry | $0 (free tier) |
+| Secret Manager | $0 (free tier) |
+| Cloudflare Email Routing | $0 (free) |
+| Cloudflare DNS | $0 (free) |
+| Resend API | $0 (free tier) |
+| GitHub Actions | $0 (free tier) |
+| **Total** | **$0.00/month** |
+
+### What could cost money
+
+| Scenario | Cost | How to avoid |
+|----------|------|--------------|
+| Dashboard min-instances=1 (kill cold starts) | ~$5/mo | Don't enable unless cold starts annoy you |
+| Exceeding 2M Cloud Run requests/mo | Usage-based | Impossible at 2 forms/day |
+| Exceeding 1,500 Gemini RPD | N/A (you use 12/day) | Would need 125x current volume |
+| Firestore exceeding 50K reads/day | $0.036/100K reads | Would need 250x current usage |
+
+---
+
+## G14. Risks & Mitigations (All-Google)
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Google kills AI Studio free tier | Need to pay or switch LLM | Gemini Flash is cheap even paid (~$0.015/form); can swap to ChatLLM/Grok |
+| Cold start on form webhook | 3-5s added latency | Acceptable for email → reply flow |
+| Firestore query limitations | Can't do arbitrary SQL aggregations | Pre-compute daily stats; use composite indexes |
+| Cloud Run 60-min timeout | Complex multi-page forms could timeout | Unlikely for forms; add retry logic |
+| Google data privacy (free tier) | Form data may train Google models | You said you don't care — but can upgrade to paid tier for $0 extra if you change mind |
+| Vendor lock-in (Firestore) | Hard to migrate away from NoSQL | Keep data export scripts; Firestore → JSON is straightforward |
+| GitHub Actions minutes | Free tier: 2,000 min/month | You'll use ~10 min/month |
+
+---
+
+## G15. Decision Matrix (All-Google)
+
+| Question | Choice |
+|----------|--------|
+| LLM Provider | **Google AI Studio free tier** (Gemini 2.5 Flash) |
+| Form Processor | **Google Cloud Run** (Python container) |
+| Dashboard | **Google Cloud Run** (Next.js container) |
+| Database | **Google Firestore** (free tier) |
+| File Storage | **Google Cloud Storage** (free 5GB) |
+| Secrets | **Google Secret Manager** |
+| DNS | **Cloudflare** (existing) |
+| Email Intake | **Cloudflare Email Worker** (existing) |
+| Email Reply | **Resend API** (existing) |
+| CI/CD | **GitHub Actions → Cloud Run** |
+| Home server | **Not needed** |
+| Monthly cost | **$0** |
