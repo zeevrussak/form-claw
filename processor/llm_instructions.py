@@ -212,11 +212,24 @@ def fill_form(input_pdf_bytes: bytes, family_data: dict) -> bytes:
 - Use the format shown on the form (usually DD/MM/YYYY for Israeli forms).
 - For birth dates, use the data from `family_data`.
 
-#### 9. Coordinate System
+#### 9. Coordinate System — CRITICAL
 - PDF origin `(0, 0)` is at the **BOTTOM-LEFT** corner.
 - Y increases upward. Page tops are typically ~842pt (A4) or ~792pt (Letter).
-- Use `page.mediabox` to get actual page dimensions.
-- All coordinates from the analysis JSON are in this system.
+- **ALWAYS** read actual page dimensions from `page.mediabox`:
+  ```python
+  width = float(page.mediabox.width)
+  height = float(page.mediabox.height)
+  ```
+- The images you see may not be the same resolution as the PDF. The coordinates in the
+  analysis JSON are APPROXIMATE. You must:
+  1. Read the actual page dimensions from `page.mediabox`.
+  2. Position fields relative to the page dimensions, NOT from hardcoded pixel values.
+  3. For image-sourced PDFs, the page size equals the image size in pixels at 72 DPI.
+     An A4-like image (e.g., ~595x842pt) is typical.
+  4. Use proportional positioning when possible:
+     `x = width * 0.75` for a field 75% from the left.
+- If coordinates from analysis look wrong, use visual landmarks from the form
+  (headers, section breaks) to estimate correct positions.
 
 #### 10. Text Overflow Prevention
 - **Measure text width** before drawing: `canvas.stringWidth(text, fontName, fontSize)`.
@@ -233,6 +246,18 @@ def fill_form(input_pdf_bytes: bytes, family_data: dict) -> bytes:
 - Handle multi-page forms: iterate over all pages.
 - Use `try/except` for robustness.
 - Add brief inline comments for coordinate placements.
+
+#### 13. CRITICAL: Actually Fill the Fields
+- You MUST fill ALL identified fields with the correct data from `family_data`.
+- Do not return a function that only draws a date — fill EVERY field:
+  parent name, child name, ID number, address, phone, signature, checkboxes, etc.
+- Match the target person to the correct child in `family_data["children"]`.
+- Match the signer to `family_data["father"]` or `family_data["mother"]`.
+- For each field, determine the correct value from family_data and draw it.
+- Test your coordinate placements mentally: does the parent name land on the
+  parent name line? Does the signature land in the signature box?
+- If unsure about exact coordinates, err on the side of reasonable positions
+  rather than leaving fields empty.
 
 ### Output
 Return ONLY the Python code inside ```python ... ``` markers.

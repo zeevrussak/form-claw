@@ -185,6 +185,8 @@ async def process_form(request: Request):
         # ----- Generate fill code -----
         fill_code = await generate_fill_code(page_images, analysis, target_person)
         log.info(f"Generated fill code ({len(fill_code)} chars)")
+        # Log first 2000 chars of generated code for debugging
+        log.info(f"Fill code preview:\n{fill_code[:2000]}")
 
         # ----- Execute fill code -----
         filled_pdf = execute_fill_code(fill_code, pdf_data, FAMILY_DATA)
@@ -231,6 +233,8 @@ async def process_form(request: Request):
             "processing_completed_at": datetime.now(timezone.utc),
             "llm_provider": f"google/{GEMINI_MODEL}",
             "instructions_detected": text_body.strip()[:500] if text_body.strip() else None,
+            "llm_analysis": analysis[:5000] if analysis else None,
+            "generated_code": fill_code[:5000] if fill_code else None,
         })
 
         return {"status": "success", "id": log_ref.id, "target": target_person, "time": round(elapsed, 2)}
