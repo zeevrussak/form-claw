@@ -16,6 +16,7 @@ import PostalMime from 'postal-mime';
 
 export interface Env {
   WEBHOOK_URL: string;
+  WEBHOOK_SECRET: string;
   WHITELISTED_SENDERS: string;
 }
 
@@ -86,9 +87,13 @@ export default {
 
     // POST to form processor daemon webhook
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (env.WEBHOOK_SECRET) {
+        headers['Authorization'] = `Bearer ${env.WEBHOOK_SECRET}`;
+      }
       const resp = await fetch(env.WEBHOOK_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(payload),
       });
 
