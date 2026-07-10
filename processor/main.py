@@ -188,9 +188,38 @@ async def process_form(request: Request):
         # Log first 2000 chars of generated code for debugging
         log.info(f"Fill code preview:\n{fill_code[:2000]}")
 
-        # ----- Execute fill code -----
-        filled_pdf = execute_fill_code(fill_code, pdf_data, FAMILY_DATA)
-        log.info(f"Filled PDF: {len(filled_pdf)} bytes")
+        # ----- Execute fill code (with retry on quality check failure) -----
+        max_attempts = 2
+        filled_pdf = None
+        fill_quality = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                attempt_code = fill_code if attempt == 1 else await generate_fill_code(page_images, analysis, target_person)
+                if attempt > 1:
+                    log.info(f"Retry attempt {attempt}: regenerated fill code ({len(attempt_code)} chars)")
+                    log.info(f"Retry code preview:\n{attempt_code[:2000]}")
+                    fill_code = attempt_code
+
+                filled_pdf = execute_fill_code(fill_code, pdf_data, FAMILY_DATA)
+                log.info(f"Filled PDF: {len(filled_pdf)} bytes (attempt {attempt})")
+
+                # Quality check: filled PDF should be meaningfully larger than original
+                fill_quality = verify_fill_quality(pdf_data, filled_pdf)
+                log.info(f"Fill quality check: {fill_quality}")
+
+                if fill_quality["passed"]:
+                    break
+                else:
+                    log.warning(f"Fill quality check FAILED (attempt {attempt}): {fill_quality['reason']}")
+                    if attempt < max_attempts:
+                        log.info("Retrying with fresh code generation...")
+            except Exception as e:
+                log.error(f"Fill attempt {attempt} failed: {e}")
+                if attempt >= max_attempts:
+                    raise
+
+        if filled_pdf is None:
+            raise RuntimeError("All fill attempts failed")
 
         # ----- Upload to Cloud Storage -----
         bucket = storage.Client().bucket(GCS_BUCKET)
@@ -235,6 +264,7 @@ async def process_form(request: Request):
             "instructions_detected": text_body.strip()[:500] if text_body.strip() else None,
             "llm_analysis": analysis[:5000] if analysis else None,
             "generated_code": fill_code[:5000] if fill_code else None,
+            "fill_quality": fill_quality,
         })
 
         return {"status": "success", "id": log_ref.id, "target": target_person, "time": round(elapsed, 2)}
@@ -495,6 +525,66 @@ async def load_knowledge(target_person: str) -> list[dict]:
     except Exception as e:
         log.warning(f"Could not load knowledge entries: {e}")
     return entries
+
+
+def verify_fill_quality(original_pdf: bytes, filled_pdf: bytes) -> dict:
+    """
+    Verify that the filled PDF actually has content added compared to the original.
+    Uses multiple heuristics:
+    1. Size increase (filled should be larger due to overlay content)
+    2. Text content extraction (filled should have more text)
+    """
+    result = {"passed": False, "reason": "", "details": {}}
+
+    # Check 1: Size comparison
+    orig_size = len(original_pdf)
+    filled_size = len(filled_pdf)
+    size_increase = filled_size - orig_size
+    size_ratio = filled_size / max(orig_size, 1)
+    result["details"]["original_size"] = orig_size
+    result["details"]["filled_size"] = filled_size
+    result["details"]["size_increase"] = size_increase
+    result["details"]["size_ratio"] = round(size_ratio, 3)
+
+    # A properly filled form should add at least some overlay content
+    # Minimum: 500 bytes increase (even a few text fields + font adds this)
+    if size_increase < 500:
+        result["reason"] = f"Filled PDF barely larger than original ({size_increase} bytes increase). Form likely unfilled."
+        return result
+
+    # Check 2: Extract text from filled PDF to verify content was added
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(io.BytesIO(filled_pdf))
+        filled_text = ""
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            filled_text += page_text
+
+        # Also check original for comparison
+        orig_reader = PdfReader(io.BytesIO(original_pdf))
+        orig_text = ""
+        for page in orig_reader.pages:
+            page_text = page.extract_text() or ""
+            orig_text += page_text
+
+        new_text_len = len(filled_text) - len(orig_text)
+        result["details"]["original_text_len"] = len(orig_text)
+        result["details"]["filled_text_len"] = len(filled_text)
+        result["details"]["new_text_added"] = new_text_len
+
+        # Check if meaningful text was added (at least a name + date)
+        if new_text_len < 10:
+            result["reason"] = f"Almost no new text extracted from filled PDF ({new_text_len} chars). Fields may be empty."
+            return result
+    except Exception as e:
+        log.warning(f"Text extraction check failed (non-fatal): {e}")
+        result["details"]["text_check_error"] = str(e)
+
+    # All checks passed
+    result["passed"] = True
+    result["reason"] = "Fill quality OK"
+    return result
 
 
 def extract_target_person(analysis: str, subject: str, body: str) -> str:
