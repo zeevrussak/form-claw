@@ -26,6 +26,12 @@ from PIL import Image
 
 from security_filter import scan_email_content
 from form_filler import execute_fill_code
+from llm_instructions import (
+    FORM_ANALYSIS_SYSTEM,
+    build_analysis_prompt,
+    CODE_GENERATION_SYSTEM,
+    build_code_generation_prompt,
+)
 
 # Supported image extensions
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.heic'}
@@ -419,29 +425,15 @@ async def analyze_form(page_images: list[bytes], subject: str, body: str) -> str
         for img in page_images
     ]
 
-    prompt = f"""You are analyzing a Hebrew PDF form for automatic filling.
-
-Email subject: "{subject}"
-Email body: "{body}"
-
-Analyze the form image(s) and return a structured JSON description of ALL fillable fields, including:
-- Field label (Hebrew and/or English)
-- Field type: text, checkbox, radio, signature, date, id_digits (9-digit ID with separate boxes)
-- Approximate coordinates (x, y in PDF points from bottom-left)
-- Field dimensions (width, height)
-- Whether it's a selection between options (OR / slash between choices)
-- Any special formatting (RTL Hebrew, digit-per-box, etc.)
-
-Also identify:
-- Who this form is about (target person) based on subject/body hints
-- Who should sign (parent/guardian for children)
-- The form's purpose
-
-Return ONLY valid JSON."""
-
+    prompt = build_analysis_prompt(subject, body)
     content = [{"type": "text", "text": prompt}] + image_parts
-    return await call_gemini([{"role": "user", "content": content}], max_tokens=8192)
-
+    return await call_gemini(
+        [
+            {"role": "system", "content": FORM_ANALYSIS_SYSTEM},
+            {"role": "user", "content": content},
+        ],
+        max_tokens=8192,
+    )
 
 async def generate_fill_code(
     page_images: list[bytes], analysis: str, target_person: str
@@ -455,45 +447,20 @@ async def generate_fill_code(
         for img in page_images
     ]
 
-    prompt = f"""You are generating Python code to fill a Hebrew PDF form using ReportLab and PyPDF2.
-
-Form analysis:
-{analysis}
-
-Target person: {target_person}
-
-Family data available (JSON):
-{json.dumps(FAMILY_DATA, ensure_ascii=False, indent=2)}
-
-Additional knowledge entries:
-{json.dumps(knowledge, ensure_ascii=False, indent=2)}
-
-Generate a Python function with this EXACT signature:
-
-```python
-def fill_form(input_pdf_bytes: bytes, family_data: dict) -> bytes:
-    \"\"\"Fill the PDF form and return filled PDF bytes.\"\"\"\n```
-
-Rules:
-1. Use ReportLab canvas to create an overlay, then merge with PyPDF2
-2. Hebrew text must be reversed ([::-1]) before drawing with drawRightString
-3. Register Hebrew font: pdfmetrics.registerFont(TTFont('Hebrew', 'fonts/FtPilKahol2.ttf'))
-4. English text: use Helvetica or register TTFont('English', 'fonts/Playzone.ttf')
-5. For ID number digit boxes: draw each digit centered in its box position
-6. For OR/slash selections: draw an ellipse around the selected option
-7. For checkboxes: draw a checkmark or X
-8. For signatures: overlay the PNG with transparency
-   - Father signature: 'signatures/zeev_signature.png'
-   - Mother signature: 'signatures/keren_signature.png'
-9. The page coordinate system has (0,0) at BOTTOM-LEFT
-10. Use page.mediabox to get page dimensions
-11. Make text fit within field boundaries — don't overflow
-12. Today's date: {datetime.now().strftime('%d/%m/%Y')}
-
-Return ONLY the Python code inside ```python ... ``` markers."""
-
+    prompt = build_code_generation_prompt(
+        analysis=analysis,
+        target_person=target_person,
+        family_data=FAMILY_DATA,
+        knowledge=knowledge,
+    )
     content = [{"type": "text", "text": prompt}] + image_parts
-    response = await call_gemini([{"role": "user", "content": content}], max_tokens=16384)
+    response = await call_gemini(
+        [
+            {"role": "system", "content": CODE_GENERATION_SYSTEM},
+            {"role": "user", "content": content},
+        ],
+        max_tokens=16384,
+    )
 
     # Extract code from markdown code block
     if "```python" in response:
