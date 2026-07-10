@@ -92,6 +92,11 @@ async def process_form(request: Request):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     payload = await request.json()
+
+    # --- Handle intake_drop events (email received but no PDFs) ---
+    if payload.get("type") == "intake_drop":
+        return await _handle_intake_drop(payload)
+
     log_ref = db.collection("form_processing_logs").document()
     sender = payload.get("from", "unknown")
     subject = payload.get("subject", "")
@@ -220,6 +225,77 @@ async def process_form(request: Request):
             log.error("Failed to send error notification email")
 
         raise HTTPException(status_code=500, detail=error_msg)
+
+
+# ---------------------------------------------------------------------------
+# Intake drop handler
+# ---------------------------------------------------------------------------
+async def _handle_intake_drop(payload: dict):
+    """Log and reply when email had no processable PDF attachments."""
+    sender = payload.get("from", "unknown")
+    subject = payload.get("subject", "")
+    reason = payload.get("reason", "Unknown reason")
+    message_id = payload.get("messageId", "")
+    in_reply_to = payload.get("inReplyTo", "")
+    references = payload.get("references", "")
+    attachment_summary = payload.get("attachmentSummary", [])
+
+    log.info(f"Intake drop from={sender} subject='{subject}' reason='{reason}'")
+
+    # Log to Firestore
+    log_ref = db.collection("form_processing_logs").document()
+    log_ref.set({
+        "received_at": datetime.now(timezone.utc),
+        "email_message_id": message_id,
+        "sender_email": sender,
+        "subject": subject,
+        "processing_status": "dropped",
+        "error_type": "IntakeDrop",
+        "error_message": reason,
+        "attachment_summary": [{
+            "filename": a.get("filename"),
+            "mimeType": a.get("mimeType"),
+            "size": a.get("size"),
+        } for a in attachment_summary],
+        "processing_time_seconds": 0,
+        "processing_completed_at": datetime.now(timezone.utc),
+    })
+
+    # Send reply to sender explaining the issue
+    att_detail = ""
+    if attachment_summary:
+        att_lines = []
+        for a in attachment_summary:
+            att_lines.append(f"  - {a.get('filename', '?')} ({a.get('mimeType', '?')}, {a.get('size', 0)} bytes)")
+        att_detail = "\n\nAttachments received:\n" + "\n".join(att_lines)
+
+    reply_text = (
+        f"Hi,\n\n"
+        f"Your email was received but could not be processed:\n\n"
+        f"{reason}\n"
+        f"{att_detail}\n\n"
+        f"Please resend with a PDF form attached and I'll fill it out for you.\n\n"
+        f"— Form Claw Bot"
+    )
+
+    try:
+        reply_headers = []
+        if in_reply_to or message_id:
+            reply_headers.append({"name": "In-Reply-To", "value": in_reply_to or message_id})
+            reply_headers.append({"name": "References", "value": references or in_reply_to or message_id})
+
+        resend.Emails.send({
+            "from": RESEND_FROM,
+            "to": [sender],
+            "subject": f"Re: {subject} [NO PDF FOUND]",
+            "text": reply_text,
+            "headers": reply_headers if reply_headers else None,
+        })
+        log.info(f"Drop notification sent to {sender}")
+    except Exception as e:
+        log.error(f"Failed to send drop notification: {e}")
+
+    return {"status": "dropped", "id": log_ref.id, "reason": reason}
 
 
 # ---------------------------------------------------------------------------

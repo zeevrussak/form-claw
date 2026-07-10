@@ -52,7 +52,7 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const statusDoc = await db.collection(COLLECTIONS.SYSTEM_STATUS).doc('current').get();
+    const statusDoc = await db.collection(COLLECTIONS.SYSTEM).doc('current').get();
     if (!statusDoc.exists) {
       return NextResponse.json({ healthy: false, message: 'No system status record' });
     }
@@ -137,7 +137,7 @@ export async function GET(req: NextRequest) {
     }
 
     // ---- Alerting (deduplicated) ----
-    const statusRef = db.collection(COLLECTIONS.SYSTEM_STATUS).doc('current');
+    const statusRef = db.collection(COLLECTIONS.SYSTEM).doc('current');
 
     if (alerts.length > 0) {
       const alertFingerprint = createHash('sha256')
