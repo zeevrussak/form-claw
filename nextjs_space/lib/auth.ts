@@ -1,14 +1,12 @@
 import { NextAuthOptions } from 'next-auth';
 import GoogleProvider from 'next-auth/providers/google';
 import CredentialsProvider from 'next-auth/providers/credentials';
-import { PrismaAdapter } from '@next-auth/prisma-adapter';
-import { prisma } from '@/lib/prisma';
 import bcrypt from 'bcryptjs';
-
+import { getDb, COLLECTIONS } from '@/lib/firestore';
 import { WHITELISTED_EMAILS } from '@/lib/whitelist';
 
 export const authOptions: NextAuthOptions = {
-  adapter: PrismaAdapter(prisma),
+  // No PrismaAdapter — using JWT-only strategy with Firestore for user lookup
   providers: [
     GoogleProvider({
       clientId: process.env.GOOGLE_CLIENT_ID ?? '',
@@ -31,13 +29,26 @@ export const authOptions: NextAuthOptions = {
           return null;
         }
         try {
-          const user = await prisma.user.findUnique({
-            where: { email: credentials.email },
-          });
-          if (!user?.password) return null;
-          const isValid = await bcrypt.compare(credentials.password, user.password);
+          const db = getDb();
+          const snapshot = await db.collection(COLLECTIONS.USERS)
+            .where('email', '==', credentials.email)
+            .limit(1)
+            .get();
+
+          if (snapshot.empty) return null;
+          const userDoc = snapshot.docs[0];
+          const user = userDoc.data();
+
+          if (!user.hashed_password) return null;
+          const isValid = await bcrypt.compare(credentials.password, user.hashed_password);
           if (!isValid) return null;
-          return { id: user.id, email: user.email, name: user.name, role: user.role };
+
+          return {
+            id: userDoc.id,
+            email: user.email,
+            name: user.name,
+            role: user.role || 'user',
+          };
         } catch (error: any) {
           console.error('Auth error:', error);
           return null;
@@ -73,10 +84,28 @@ export const authOptions: NextAuthOptions = {
     },
   },
   callbacks: {
-    async signIn({ user, account }) {
+    async signIn({ user }) {
       const email = user?.email?.toLowerCase() ?? '';
       if (!WHITELISTED_EMAILS.includes(email)) {
         return '/login?error=AccessDenied';
+      }
+      // Upsert user in Firestore on Google login
+      try {
+        const db = getDb();
+        const snapshot = await db.collection(COLLECTIONS.USERS)
+          .where('email', '==', email)
+          .limit(1)
+          .get();
+        if (snapshot.empty) {
+          await db.collection(COLLECTIONS.USERS).add({
+            email,
+            name: user.name || null,
+            role: 'admin',
+            created_at: new Date(),
+          });
+        }
+      } catch (e) {
+        console.error('Firestore user upsert error:', e);
       }
       return true;
     },

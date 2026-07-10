@@ -3,73 +3,87 @@ export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
-import { prisma } from '@/lib/prisma';
+import { getDb, COLLECTIONS, toDate } from '@/lib/firestore';
 
-export async function GET(req: NextRequest) {
-  try {
-    const session = await getServerSession(authOptions);
-    if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+export async function GET(request: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-    const { searchParams } = new URL(req.url);
-    const category = searchParams.get('category');
-    const person = searchParams.get('person');
-    const search = searchParams.get('search');
-    const page = parseInt(searchParams.get('page') || '1');
-    const limit = parseInt(searchParams.get('limit') || '50');
+  const sp = request.nextUrl.searchParams;
+  const page = parseInt(sp.get('page') || '1');
+  const limit = parseInt(sp.get('limit') || '20');
+  const category = sp.get('category');
+  const person = sp.get('person');
+  const search = sp.get('search');
 
-    const where: Record<string, unknown> = { isActive: true };
-    if (category && category !== 'all') where.category = category;
-    if (person && person !== 'all') where.appliesToPerson = person === 'family' ? null : person;
-    if (search) {
-      where.OR = [
-        { key: { contains: search, mode: 'insensitive' as const } },
-        { value: { contains: search, mode: 'insensitive' as const } },
-      ];
-    }
+  const db = getDb();
+  let query: FirebaseFirestore.Query = db.collection(COLLECTIONS.KNOWLEDGE)
+    .where('is_active', '==', true);
 
-    const [entries, total] = await Promise.all([
-      prisma.knowledgeEntry.findMany({
-        where: where as any,
-        orderBy: [{ category: 'asc' }, { key: 'asc' }],
-        skip: (page - 1) * limit,
-        take: limit,
-      }),
-      prisma.knowledgeEntry.count({ where: where as any }),
-    ]);
+  if (category) query = query.where('category', '==', category);
+  if (person) query = query.where('applies_to_person', '==', person);
 
-    return NextResponse.json({ entries, total, page, totalPages: Math.ceil(total / limit) });
-  } catch (error) {
-    console.error('Knowledge GET error:', error);
-    return NextResponse.json({ error: 'Failed to fetch knowledge entries' }, { status: 500 });
+  const snapshot = await query.get();
+  let entries = snapshot.docs.map(doc => {
+    const d = doc.data();
+    return {
+      id: doc.id,
+      key: d.key,
+      value: d.value,
+      category: d.category || 'general',
+      appliesToPerson: d.applies_to_person,
+      language: d.language || 'both',
+      source: d.source || 'manual',
+      isActive: d.is_active,
+      updatedAt: toDate(d.updated_at)?.toISOString() || null,
+    };
+  });
+
+  // Client-side search
+  if (search) {
+    const s = search.toLowerCase();
+    entries = entries.filter(e =>
+      (e.key || '').toLowerCase().includes(s) ||
+      (e.value || '').toLowerCase().includes(s)
+    );
   }
+
+  // Sort by category then key
+  entries.sort((a, b) => a.category.localeCompare(b.category) || a.key.localeCompare(b.key));
+
+  const total = entries.length;
+  const offset = (page - 1) * limit;
+  const paginated = entries.slice(offset, offset + limit);
+
+  return NextResponse.json({
+    entries: paginated,
+    total,
+    page,
+    totalPages: Math.ceil(total / limit),
+  });
 }
 
-export async function POST(req: NextRequest) {
-  try {
-    const session = await getServerSession(authOptions);
-    if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+export async function POST(request: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-    const body = await req.json();
-    const { key, value, category, language, appliesToPerson, source } = body;
-
-    if (!key || !value) {
-      return NextResponse.json({ error: 'Key and value are required' }, { status: 400 });
-    }
-
-    const entry = await prisma.knowledgeEntry.create({
-      data: {
-        key,
-        value,
-        category: category || 'general',
-        language: language || 'both',
-        appliesToPerson: appliesToPerson || null,
-        source: source || 'manual',
-      },
-    });
-
-    return NextResponse.json({ entry }, { status: 201 });
-  } catch (error) {
-    console.error('Knowledge POST error:', error);
-    return NextResponse.json({ error: 'Failed to create knowledge entry' }, { status: 500 });
+  const body = await request.json();
+  if (!body.key || !body.value) {
+    return NextResponse.json({ error: 'key and value required' }, { status: 400 });
   }
+
+  const db = getDb();
+  const ref = await db.collection(COLLECTIONS.KNOWLEDGE).add({
+    key: body.key,
+    value: body.value,
+    category: body.category || 'general',
+    language: body.language || 'both',
+    applies_to_person: body.appliesToPerson || null,
+    source: body.source || 'manual',
+    is_active: true,
+    created_at: new Date(),
+    updated_at: new Date(),
+  });
+
+  return NextResponse.json({ id: ref.id, success: true });
 }

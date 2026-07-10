@@ -36,3 +36,12 @@ jobs:
             --min-instances=0
             --max-instances=2
             --allow-unauthenticated
+
+  e2e-test:
+    needs: deploy
+    uses: ./.github/workflows/e2e-test.yml
+    with:
+      component: dashboard
+    secrets:
+      PROCESSOR_URL: ${{ secrets.PROCESSOR_URL }}
+      WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}

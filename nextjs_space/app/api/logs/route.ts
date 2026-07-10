@@ -3,83 +3,88 @@ export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
-import { prisma } from '@/lib/prisma';
-import { Decimal } from '@prisma/client/runtime/library';
+import { getDb, COLLECTIONS, toDate } from '@/lib/firestore';
 
-function safeDecimal(val: Decimal | null | undefined): number | null {
-  if (val == null) return null;
-  return Number(val);
-}
+export async function GET(request: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-export async function GET(req: NextRequest) {
-  try {
-    const session = await getServerSession(authOptions);
-    if (!session) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
+  const searchParams = request.nextUrl.searchParams;
+  const page = parseInt(searchParams.get('page') || '1');
+  const limit = parseInt(searchParams.get('limit') || '20');
+  const status = searchParams.get('status');
+  const sender = searchParams.get('sender');
+  const search = searchParams.get('search');
+  const startDate = searchParams.get('startDate');
+  const endDate = searchParams.get('endDate');
 
-    const url = new URL(req.url);
-    const page = parseInt(url.searchParams.get('page') ?? '1');
-    const limit = parseInt(url.searchParams.get('limit') ?? '20');
-    const status = url.searchParams.get('status') ?? undefined;
-    const sender = url.searchParams.get('sender') ?? undefined;
-    const search = url.searchParams.get('search') ?? undefined;
-    const startDate = url.searchParams.get('startDate') ?? undefined;
-    const endDate = url.searchParams.get('endDate') ?? undefined;
+  const db = getDb();
+  let query: FirebaseFirestore.Query = db.collection(COLLECTIONS.LOGS)
+    .orderBy('received_at', 'desc');
 
-    const where: any = {};
-    if (status && status !== 'all') where.processing_status = status;
-    if (sender && sender !== 'all') where.sender_email = sender;
-    if (search) where.subject = { contains: search, mode: 'insensitive' as any };
-    if (startDate || endDate) {
-      where.received_at = {};
-      if (startDate) where.received_at.gte = new Date(startDate);
-      if (endDate) where.received_at.lte = new Date(endDate);
-    }
-
-    const [logs, total] = await Promise.all([
-      prisma.formProcessingLog.findMany({
-        where,
-        orderBy: { received_at: 'desc' },
-        skip: (page - 1) * limit,
-        take: limit,
-      }),
-      prisma.formProcessingLog.count({ where }),
-    ]);
-
-    const safeLogs = (logs ?? [])?.map?.((log: any) => ({
-      id: log?.id ?? 0,
-      emailMessageId: log?.email_message_id ?? '',
-      receivedAt: log?.received_at?.toISOString?.() ?? null,
-      senderEmail: log?.sender_email ?? null,
-      senderName: log?.sender_name ?? null,
-      subject: log?.subject ?? null,
-      attachmentFilename: log?.attachment_filename ?? null,
-      attachmentType: log?.attachment_type ?? null,
-      attachmentCount: log?.attachment_count ?? 0,
-      pageCount: log?.page_count ?? null,
-      targetPerson: log?.target_person ?? null,
-      signer: log?.signer ?? null,
-      processingStatus: log?.processing_status ?? 'unknown',
-      processingStartedAt: log?.processing_started_at?.toISOString?.() ?? null,
-      processingCompletedAt: log?.processing_completed_at?.toISOString?.() ?? null,
-      processingTimeSeconds: safeDecimal(log?.processing_time_seconds),
-      filledPdfFilename: log?.filled_pdf_filename ?? null,
-      errorMessage: log?.error_message ?? null,
-      errorType: log?.error_type ?? null,
-      instructionsDetected: log?.instructions_detected ?? null,
-      markedAsRead: log?.marked_as_read ?? false,
-      createdAt: log?.created_at?.toISOString?.() ?? null,
-    })) ?? [];
-
-    return NextResponse.json({
-      logs: safeLogs,
-      total: total ?? 0,
-      page,
-      totalPages: Math.ceil((total ?? 0) / limit),
-    });
-  } catch (error: any) {
-    console.error('Logs API error:', error);
-    return NextResponse.json({ error: 'Failed to fetch logs' }, { status: 500 });
+  if (status) {
+    query = query.where('processing_status', '==', status);
   }
+  if (sender) {
+    query = query.where('sender_email', '==', sender);
+  }
+  if (startDate) {
+    query = query.where('received_at', '>=', new Date(startDate));
+  }
+  if (endDate) {
+    query = query.where('received_at', '<=', new Date(endDate));
+  }
+
+  // Get total count (Firestore doesn't have native count in free tier easily)
+  // We'll use a separate count query
+  const countSnap = await query.count().get();
+  const total = countSnap.data().count;
+
+  // Paginate
+  const offset = (page - 1) * limit;
+  const snapshot = await query.offset(offset).limit(limit).get();
+
+  const logs = snapshot.docs.map(doc => {
+    const d = doc.data();
+    return {
+      id: doc.id,
+      emailMessageId: d.email_message_id,
+      receivedAt: toDate(d.received_at)?.toISOString() || null,
+      senderEmail: d.sender_email,
+      senderName: d.sender_name,
+      subject: d.subject,
+      attachmentFilename: d.attachment_filename,
+      attachmentType: d.attachment_type,
+      attachmentCount: d.attachment_count || 0,
+      pageCount: d.page_count,
+      targetPerson: d.target_person,
+      signer: d.signer,
+      processingStatus: d.processing_status,
+      processingStartedAt: toDate(d.processing_started_at)?.toISOString() || null,
+      processingCompletedAt: toDate(d.processing_completed_at)?.toISOString() || null,
+      processingTimeSeconds: d.processing_time_seconds || 0,
+      filledPdfFilename: d.filled_pdf_filename || d.filled_pdf_path,
+      errorMessage: d.error_message,
+      errorType: d.error_type,
+      instructionsDetected: d.instructions_detected,
+      createdAt: toDate(d.created_at)?.toISOString() || toDate(d.received_at)?.toISOString(),
+    };
+  });
+
+  // Client-side search filter (Firestore doesn't support LIKE)
+  let filtered = logs;
+  if (search) {
+    const s = search.toLowerCase();
+    filtered = logs.filter(l =>
+      (l.subject || '').toLowerCase().includes(s) ||
+      (l.senderEmail || '').toLowerCase().includes(s)
+    );
+  }
+
+  return NextResponse.json({
+    logs: filtered,
+    total,
+    page,
+    totalPages: Math.ceil(total / limit),
+  });
 }

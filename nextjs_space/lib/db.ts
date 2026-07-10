@@ -1,9 +1,7 @@
-import { PrismaClient } from '@prisma/client'
+// DEPRECATED: This file is kept for backward compatibility.
+// The dashboard now uses Firestore via lib/firestore.ts
+// Any code importing from here should be migrated to use Firestore.
 
-const globalForPrisma = globalThis as unknown as {
-  prisma: PrismaClient | undefined
-}
+import { db, COLLECTIONS } from './firestore';
 
-export const prisma = globalForPrisma.prisma ?? new PrismaClient()
-
-if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma
+export { db, COLLECTIONS };

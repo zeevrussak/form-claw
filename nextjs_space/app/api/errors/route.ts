@@ -3,62 +3,61 @@ export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
-import { prisma } from '@/lib/prisma';
+import { getDb, COLLECTIONS, toDate } from '@/lib/firestore';
 
-export async function GET(req: NextRequest) {
-  try {
-    const session = await getServerSession(authOptions);
-    if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+export async function GET(request: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-    const url = new URL(req.url);
-    const page = parseInt(url.searchParams.get('page') ?? '1');
-    const limit = parseInt(url.searchParams.get('limit') ?? '20');
-    const errorType = url.searchParams.get('errorType') ?? undefined;
+  const searchParams = request.nextUrl.searchParams;
+  const page = parseInt(searchParams.get('page') || '1');
+  const limit = parseInt(searchParams.get('limit') || '20');
+  const errorType = searchParams.get('errorType');
 
-    const where: any = { processing_status: 'failed' };
-    if (errorType && errorType !== 'all') where.error_type = errorType;
+  const db = getDb();
+  let query: FirebaseFirestore.Query = db.collection(COLLECTIONS.LOGS)
+    .where('processing_status', '==', 'failed')
+    .orderBy('received_at', 'desc');
 
-    const [errors, total, errorTypes] = await Promise.all([
-      prisma.formProcessingLog.findMany({
-        where,
-        orderBy: { received_at: 'desc' },
-        skip: (page - 1) * limit,
-        take: limit,
-      }).catch(() => []),
-      prisma.formProcessingLog.count({ where }).catch(() => 0),
-      prisma.formProcessingLog.groupBy({
-        by: ['error_type'],
-        where: { processing_status: 'failed', error_type: { not: null } },
-        _count: { id: true },
-      }).catch(() => []),
-    ]);
+  const snapshot = await query.get();
+  let allErrors = snapshot.docs.map(doc => {
+    const d = doc.data();
+    return {
+      id: doc.id,
+      receivedAt: toDate(d.received_at)?.toISOString() || null,
+      senderEmail: d.sender_email,
+      senderName: d.sender_name,
+      subject: d.subject,
+      errorMessage: d.error_message,
+      errorType: d.error_type || 'Unknown',
+      targetPerson: d.target_person,
+      processingTimeSeconds: d.processing_time_seconds || 0,
+    };
+  });
 
-    const safeErrors = (errors as any[])?.map?.((e: any) => ({
-      id: e?.id ?? 0,
-      receivedAt: e?.received_at?.toISOString?.() ?? null,
-      senderEmail: e?.sender_email ?? null,
-      senderName: e?.sender_name ?? null,
-      subject: e?.subject ?? null,
-      errorMessage: e?.error_message ?? null,
-      errorType: e?.error_type ?? null,
-      targetPerson: e?.target_person ?? null,
-      processingTimeSeconds: e?.processing_time_seconds != null ? Number(e.processing_time_seconds) : null,
-      emailMessageId: e?.email_message_id ?? null,
-      instructionsDetected: e?.instructions_detected ?? null,
-    })) ?? [];
-
-    return NextResponse.json({
-      errors: safeErrors,
-      total: total ?? 0,
-      page,
-      totalPages: Math.ceil((total ?? 0) / limit),
-      errorTypes: (errorTypes as any[])?.map?.((e: any) => ({
-        type: e?.error_type ?? 'Unknown',
-        count: e?._count?.id ?? 0,
-      })) ?? [],
-    });
-  } catch (error: any) {
-    console.error('Errors API error:', error);
-    return NextResponse.json({ error: 'Failed to fetch errors' }, { status: 500 });
+  // Filter by error type client-side
+  if (errorType) {
+    allErrors = allErrors.filter(e => e.errorType === errorType);
   }
+
+  // Error type breakdown
+  const typeMap: Record<string, number> = {};
+  allErrors.forEach(e => {
+    typeMap[e.errorType] = (typeMap[e.errorType] || 0) + 1;
+  });
+  const errorTypes = Object.entries(typeMap)
+    .map(([type, count]) => ({ type, count }))
+    .sort((a, b) => b.count - a.count);
+
+  const total = allErrors.length;
+  const offset = (page - 1) * limit;
+  const paginated = allErrors.slice(offset, offset + limit);
+
+  return NextResponse.json({
+    errors: paginated,
+    total,
+    page,
+    totalPages: Math.ceil(total / limit),
+    errorTypes,
+  });
 }

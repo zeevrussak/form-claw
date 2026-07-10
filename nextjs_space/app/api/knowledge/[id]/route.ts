@@ -3,49 +3,45 @@ export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
-import { prisma } from '@/lib/prisma';
+import { getDb, COLLECTIONS } from '@/lib/firestore';
 
-export async function PUT(req: NextRequest, { params }: { params: { id: string } }) {
-  try {
-    const session = await getServerSession(authOptions);
-    if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+export async function PUT(
+  request: NextRequest,
+  { params }: { params: { id: string } }
+) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-    const body = await req.json();
-    const { key, value, category, language, appliesToPerson, source, isActive } = body;
+  const body = await request.json();
+  const db = getDb();
+  const ref = db.collection(COLLECTIONS.KNOWLEDGE).doc(params.id);
 
-    const entry = await prisma.knowledgeEntry.update({
-      where: { id: params.id },
-      data: {
-        ...(key !== undefined ? { key } : {}),
-        ...(value !== undefined ? { value } : {}),
-        ...(category !== undefined ? { category } : {}),
-        ...(language !== undefined ? { language } : {}),
-        ...(appliesToPerson !== undefined ? { appliesToPerson } : {}),
-        ...(source !== undefined ? { source } : {}),
-        ...(isActive !== undefined ? { isActive } : {}),
-      },
-    });
+  const updates: Record<string, any> = { updated_at: new Date() };
+  if ('key' in body) updates.key = body.key;
+  if ('value' in body) updates.value = body.value;
+  if ('category' in body) updates.category = body.category;
+  if ('language' in body) updates.language = body.language;
+  if ('appliesToPerson' in body) updates.applies_to_person = body.appliesToPerson;
+  if ('source' in body) updates.source = body.source;
+  if ('isActive' in body) updates.is_active = body.isActive;
 
-    return NextResponse.json({ entry });
-  } catch (error) {
-    console.error('Knowledge PUT error:', error);
-    return NextResponse.json({ error: 'Failed to update knowledge entry' }, { status: 500 });
-  }
+  await ref.update(updates);
+
+  return NextResponse.json({ success: true });
 }
 
-export async function DELETE(req: NextRequest, { params }: { params: { id: string } }) {
-  try {
-    const session = await getServerSession(authOptions);
-    if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+export async function DELETE(
+  request: NextRequest,
+  { params }: { params: { id: string } }
+) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-    await prisma.knowledgeEntry.update({
-      where: { id: params.id },
-      data: { isActive: false },
-    });
+  const db = getDb();
+  await db.collection(COLLECTIONS.KNOWLEDGE).doc(params.id).update({
+    is_active: false,
+    updated_at: new Date(),
+  });
 
-    return NextResponse.json({ success: true });
-  } catch (error) {
-    console.error('Knowledge DELETE error:', error);
-    return NextResponse.json({ error: 'Failed to delete knowledge entry' }, { status: 500 });
-  }
+  return NextResponse.json({ success: true });
 }

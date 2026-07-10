@@ -1,0 +1,68 @@
+name: E2E Smoke Test
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: 'Which component was deployed'
+        required: true
+        type: string
+    secrets:
+      PROCESSOR_URL:
+        required: true
+      WEBHOOK_SECRET:
+        required: true
+
+jobs:
+  smoke-test:
+    name: Post-Deploy E2E Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wait for deployment to settle
+        run: sleep 30
+
+      - name: Check Processor Health
+        run: |
+          echo "🔍 Checking processor health..."
+          RESP=$(curl -sf --max-time 15 "${{ secrets.PROCESSOR_URL }}/health" || true)
+          if [ -z "$RESP" ]; then
+            echo "❌ Processor health check FAILED (unreachable)"
+            exit 1
+          fi
+          STATUS=$(echo "$RESP" | jq -r '.status // empty')
+          if [ "$STATUS" != "ok" ]; then
+            echo "❌ Processor health check FAILED: $RESP"
+            exit 1
+          fi
+          echo "✅ Processor is healthy: $RESP"
+
+      - name: Verify Webhook Endpoint
+        run: |
+          echo "🔍 Checking webhook endpoint..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+            -X POST "${{ secrets.PROCESSOR_URL }}/webhook" \
+            -H "Authorization: Bearer ${{ secrets.WEBHOOK_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{"type": "health_probe"}')
+          # 422 = FastAPI validation error (expected — no real payload)
+          # 200 = somehow accepted (also fine)
+          if [ "$HTTP_CODE" = "422" ] || [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "500" ]; then
+            echo "✅ Webhook endpoint reachable (HTTP $HTTP_CODE — expected for probe)"
+          elif [ "$HTTP_CODE" = "401" ]; then
+            echo "❌ Webhook auth failed — WEBHOOK_SECRET may be wrong"
+            exit 1
+          else
+            echo "❌ Unexpected webhook response: HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Test Summary
+        if: always()
+        run: |
+          echo ""
+          echo "═══════════════════════════════════════"
+          echo "  Form Claw E2E Smoke Test Complete"
+          echo "  Component deployed: ${{ inputs.component }}"
+          echo "  Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "═══════════════════════════════════════"

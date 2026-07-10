@@ -1,7 +1,7 @@
 export const dynamic = 'force-dynamic';
 
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { db, COLLECTIONS } from '@/lib/firestore';
 
 /**
  * POST /api/health/heartbeat
@@ -13,7 +13,7 @@ export async function POST(req: NextRequest) {
   try {
     const authHeader = req.headers.get('authorization');
     const expectedToken = process.env.HEARTBEAT_TOKEN;
-    
+
     if (!expectedToken || !authHeader || authHeader !== `Bearer ${expectedToken}`) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
@@ -26,72 +26,37 @@ export async function POST(req: NextRequest) {
     }
 
     const now = new Date();
-    let systemStatus = await prisma.systemStatus.findFirst({ orderBy: { updatedAt: 'desc' } });
+    const statusRef = db.collection(COLLECTIONS.SYSTEM).doc('current');
+    const statusDoc = await statusRef.get();
 
-    const updateData: Record<string, any> = {};
-
-    if (daemon === 'form_process') {
-      updateData.lastFormProcessRun = now;
-      updateData.formProcessStatus = status || 'ok';
-      updateData.lastCloudflareEmail = now;
-    }
-
-    if (systemStatus) {
-      await prisma.systemStatus.update({
-        where: { id: systemStatus.id },
-        data: updateData,
-      });
-    } else {
-      await prisma.systemStatus.create({
-        data: {
-          gmailWatchActive: false,
-          ...updateData,
-        },
-      });
-    }
-
-    return NextResponse.json({ ok: true, daemon, status, timestamp: now.toISOString() });
-  } catch (error: any) {
-    console.error('Heartbeat error:', error);
-    return NextResponse.json({ error: 'Failed to record heartbeat' }, { status: 500 });
-  }
-}
-
-/**
- * GET /api/health/heartbeat
- * Public health check - returns daemon statuses and staleness.
- */
-export async function GET(req: NextRequest) {
-  try {
-    const systemStatus = await prisma.systemStatus.findFirst({ orderBy: { updatedAt: 'desc' } });
-
-    if (!systemStatus) {
-      return NextResponse.json({ healthy: false, message: 'No system status record found' });
-    }
-
-    const now = Date.now();
-    const formAge = systemStatus.lastFormProcessRun ? now - systemStatus.lastFormProcessRun.getTime() : null;
-
-    const daemons = {
-      formProcessor: {
-        lastRun: systemStatus.lastFormProcessRun?.toISOString() ?? null,
-        status: systemStatus.formProcessStatus,
-        stale: false, // event-driven
-        ageMinutes: formAge !== null ? Math.round(formAge / 60000) : null,
-        expectedIntervalMinutes: null, // event-driven
-      },
+    const updateData: Record<string, any> = {
+      updated_at: now,
     };
 
-    const healthy = systemStatus.formProcessStatus !== 'error';
+    if (daemon === 'form_process') {
+      updateData.processor_status = status === 'ok' ? 'healthy' : 'error';
+      updateData.processor_last_heartbeat = now;
+      if (message) updateData.processor_message = message;
+      if (status === 'error') {
+        updateData.processor_error = message || 'Unknown error';
+        updateData.processor_error_at = now;
+      }
+    }
 
-    return NextResponse.json({
-      healthy,
-      emailSource: systemStatus.emailSource ?? 'cloudflare',
-      daemons,
-      lastCloudflareEmail: systemStatus.lastCloudflareEmail?.toISOString() ?? null,
-    });
+    if (statusDoc.exists) {
+      await statusRef.update(updateData);
+    } else {
+      await statusRef.set({
+        ...updateData,
+        created_at: now,
+        webhook_enabled: true,
+        processor_status: 'healthy',
+      });
+    }
+
+    return NextResponse.json({ ok: true, updated: now.toISOString() });
   } catch (error: any) {
-    console.error('Health check error:', error);
-    return NextResponse.json({ healthy: false, error: 'Health check failed' }, { status: 500 });
+    console.error('Heartbeat error:', error);
+    return NextResponse.json({ error: 'Failed to update heartbeat' }, { status: 500 });
   }
 }

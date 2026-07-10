@@ -1,13 +1,8 @@
-import { PrismaClient } from '@prisma/client';
+/**
+ * DEPRECATED: This file existed for the Prisma/PostgreSQL setup.
+ * Now replaced by lib/firestore.ts for the Google Cloud deployment.
+ * This stub prevents import errors during migration.
+ */
 
-const globalForPrisma = globalThis as unknown as {
-  prisma: PrismaClient | undefined;
-};
-
-export const prisma =
-  globalForPrisma.prisma ??
-  new PrismaClient({
-    log: process.env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
-  });
-
-if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;
+export const prisma = null;
+console.warn('prisma.ts is deprecated. Use lib/firestore.ts instead.');

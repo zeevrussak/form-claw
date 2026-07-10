@@ -1,200 +1,235 @@
-# Software Requirements Specification (SRS)
-## Form Claw — Automated PDF Form-Filling System
+# Form Claw — Software Requirements Specification (SRS)
 
-**Version:** 1.2  
-**Date:** June 4, 2026  
-**Author:** Form Claw Project  
+**Version:** 2.0  
+**Date:** July 2026  
+**Project:** Form Claw — Automated Hebrew PDF Form Filler  
 
 ---
 
 ## 1. Introduction
 
 ### 1.1 Purpose
-Form Claw is an automated system that monitors a Gmail inbox, receives PDF/DOC/image form attachments, intelligently fills them with family member data, and replies with the completed form — all without manual intervention.
+
+Form Claw automates the process of filling Hebrew PDF forms for the Russak family. Users send a form via email and receive the completed form as a reply, eliminating manual data entry.
 
 ### 1.2 Scope
-The system consists of three major components:
-1. **Email Processing Pipeline** — daemon tasks that poll Gmail, normalize attachments, and fill forms using LLM + PDF manipulation
-2. **Monitoring Dashboard** — a web application for viewing activity logs, statistics, errors, knowledge base, and system health
-3. **Knowledge Store** — a persistent, editable database of family information used by the bot to fill forms, with auto-curation from interactions
 
-### 1.3 Target Users
-- Authorized family members who forward forms via email
-- The system itself (autonomous processing)
+The system encompasses:
+- Email reception and attachment processing
+- AI-powered form analysis (field detection, coordinate mapping)
+- Automated form filling (text, signatures, checkboxes, ID digits)
+- Reply delivery with the filled PDF
+- Monitoring dashboard with analytics and health checks
+
+### 1.3 Definitions
+
+| Term | Definition |
+|------|------------|
+| Form Claw | The complete automated form-filling system |
+| Processor | The Cloud Run service that performs AI analysis and form filling |
+| Email Worker | The Cloudflare Worker that receives and routes emails |
+| Knowledge Base | Family-specific data entries stored in Firestore |
+| Intake Drop | An email received but not processed (no valid attachments) |
 
 ---
 
-## 2. System Overview
+## 2. Overall Description
 
-### 2.1 High-Level Architecture
-```
-[Email Sender] → [Gmail: russakbot@gmail.com] → [Google Pub/Sub Webhook]
-       ↓
-[Polling Bridge Daemon] → [Form Processing Daemon (event-based)]
-       ↓
-[Normalize Attachment] → [OCR if image] → [LLM Analysis & Fill]
-       ↓
-[Reply with filled PDF] → [Log to Database]
-       ↓
-[Dashboard reads DB] ← [User views dashboard]
-```
+### 2.1 System Context
 
-### 2.2 Email Flow
-1. Family members forward forms to `formfill@20032014.xyz` (alias for `russakbot@gmail.com`)
-2. Google Pub/Sub notifies the system of new messages
-3. A polling bridge daemon picks up new messages and triggers the processing daemon via webhook
-4. The processing daemon fills the form and replies in the same email thread
+Form Claw operates as an email-driven automation pipeline:
+
+1. Family members send emails with PDF or image attachments to `formclaw@savlil.com`
+2. The system identifies the target person and signer from email context
+3. AI vision analyzes form structure and generates filling code
+4. The filled PDF is sent back as an email reply
+
+### 2.2 User Classes
+
+| User | Description | Access |
+|------|-------------|--------|
+| Family member | Sends forms for filling | Email (whitelisted) |
+| Admin | Monitors system, manages knowledge | Dashboard (Google SSO) |
+
+### 2.3 Operating Environment
+
+| Component | Environment |
+|-----------|-------------|
+| Email reception | Cloudflare Email Routing |
+| Email processing | Cloudflare Workers (V8 isolate) |
+| Form processing | Google Cloud Run (container) |
+| Dashboard | Google Cloud Run (container) |
+| Data storage | Google Cloud Firestore |
+| File storage | Google Cloud Storage |
+| Email sending | Resend API |
+| AI model | Google Gemini Flash |
 
 ---
 
 ## 3. Functional Requirements
 
-### 3.1 Email Monitoring (FR-01)
-- **FR-01.1:** System SHALL monitor `russakbot@gmail.com` for new incoming emails
-- **FR-01.2:** System SHALL use Google Cloud Pub/Sub (project: `form-claw`, topic: `gmail-formbot`) for real-time notifications
-- **FR-01.3:** A separate daemon SHALL renew the Gmail watch subscription every 6 days before expiration
-- **FR-01.4:** System SHALL only process emails from whitelisted senders:
-  - `k6622024@gmail.com` (Keren)
-  - `2396119@gmail.com` (Ze'ev)
-  - `zeev@infiniplex.life` (Ze'ev alternate)
-  - `targetmailbox@gmail.com` (testing)
-- **FR-01.5:** System SHALL mark processed emails as READ immediately after extracting attachments
+### 3.1 Email Reception (FR-100)
 
-### 3.2 Attachment Normalization (FR-02)
-- **FR-02.1:** PDF files SHALL be processed directly
-- **FR-02.2:** DOC/DOCX files SHALL be converted to PDF using LibreOffice headless mode
-- **FR-02.3:** Image files (PNG, JPG, JPEG) SHALL be merged into a single multi-page PDF using `img2pdf`
-- **FR-02.4:** Image-based PDFs SHALL go through an OCR pipeline before processing
-- **FR-02.5:** Multi-page forms SHALL be supported (all pages filled)
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR-101 | System SHALL receive emails at formclaw@savlil.com | Must |
+| FR-102 | System SHALL accept PDF attachments (application/pdf) | Must |
+| FR-103 | System SHALL accept image attachments (JPG, PNG, WEBP, HEIC) | Must |
+| FR-104 | System SHALL convert image attachments to PDF before processing | Must |
+| FR-105 | System SHALL reply with an error when no valid attachments are found | Must |
+| FR-106 | System SHALL extract email threading headers for proper reply threading | Should |
+| FR-107 | System SHALL classify attachments by MIME type and file extension | Must |
 
-### 3.3 Form Filling (FR-03)
-- **FR-03.1:** System SHALL use LLM (via Abacus.AI RouteLLM API) to analyze form structure and determine field locations
-- **FR-03.2:** System SHALL read family data from the Knowledge Store (database) to populate fields
-- **FR-03.3:** System SHALL use configurable fonts:
-  - English fields: configurable (default: "Playzone", file: `Playzone.ttf`)
-  - Hebrew fields: configurable (default: "פיל כחול", file: `FtPilKahol2.ttf`)
-- **FR-03.4:** Font names SHALL be configurable from the dashboard Settings page
-- **FR-03.5:** System SHALL place the correct signature (Ze'ev or Keren) based on the detected signer
-- **FR-03.6:** For fields with OR/slash options, system SHALL mark the correct choice with an ellipse
-- **FR-03.7:** Filled text SHALL NOT overflow onto existing form text or lines
+### 3.2 Form Analysis (FR-200)
 
-### 3.4 Instruction Parsing (FR-04)
-- **FR-04.1:** System SHALL parse email subject and body for instructions in Hebrew and English
-- **FR-04.2:** Instructions SHALL override auto-detection for:
-  - Target child (e.g., "עבור סביון" → Savyon, "For Clil" → Clil)
-  - Signer (e.g., "על ידי קרן" → Keren signs, "by Ze'ev" → Ze'ev signs)
-- **FR-04.3:** System SHALL support keyword detection for both parents and both children
-- **FR-04.4:** If no explicit instruction, system SHALL attempt auto-detection from form content
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR-201 | System SHALL convert PDF pages to images for AI analysis | Must |
+| FR-202 | System SHALL identify all fillable fields with coordinates | Must |
+| FR-203 | System SHALL detect field types: text, date, checkbox, radio, signature, ID digits | Must |
+| FR-204 | System SHALL identify OR/slash selection constructs (כן/לא, אב/אם) | Must |
+| FR-205 | System SHALL determine the target person from email context | Must |
+| FR-206 | System SHALL determine the signer (parent) from email context | Should |
+| FR-207 | System SHALL identify the form's purpose and issuing body | Should |
 
-### 3.5 Reply Mechanism (FR-05)
-- **FR-05.1:** System SHALL reply in the same email thread with the filled PDF attached
-- **FR-05.2:** Reply body SHALL be plain text (not HTML to avoid .htm attachment issues)
-- **FR-05.3:** Reply SHALL include a brief summary of what was filled
+### 3.3 Form Filling (FR-300)
 
-### 3.6 Knowledge Curation (FR-06)
-- **FR-06.1:** System SHALL maintain a persistent knowledge store in the database (`knowledge_entries` table)
-- **FR-06.2:** Knowledge entries SHALL have: key, value, category, language, appliesToPerson, source, isActive
-- **FR-06.3:** Categories SHALL include: personal, address, medical, school, contact, preference, general
-- **FR-06.4:** When the bot asks for clarification and receives new information, it SHALL auto-curate this into the knowledge store
-- **FR-06.5:** Auto-curated entries SHALL be marked with source indicating the email/interaction they came from
-- **FR-06.6:** Knowledge entries SHALL be viewable and editable from the dashboard
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR-301 | System SHALL generate Python code using ReportLab for PDF overlay | Must |
+| FR-302 | System SHALL handle Hebrew RTL text with character reversal | Must |
+| FR-303 | System SHALL fill ID number digit boxes individually | Must |
+| FR-304 | System SHALL draw ellipses around selected options (OR/slash) | Must |
+| FR-305 | System SHALL overlay signature PNG images with transparency | Must |
+| FR-306 | System SHALL prevent text overflow beyond field boundaries | Must |
+| FR-307 | System SHALL use family data and knowledge base entries | Must |
+| FR-308 | System SHALL merge overlay with original PDF without quality loss | Must |
+| FR-309 | System SHALL support multi-page forms | Must |
 
-### 3.7 Dashboard (FR-07)
-- **FR-07.1:** Dashboard SHALL require authentication (Google SSO with email whitelist)
-- **FR-07.2:** Dashboard SHALL display:
-  - **Overview:** system status cards, today's stats, quick metrics
-  - **Activity Log:** paginated, filterable table of all form processing events
-  - **Statistics:** charts (daily trends, status distribution, processing time, sender/target breakdown)
-  - **Error Log:** filterable error list with CSV export
-  - **Knowledge Base:** searchable, filterable, editable knowledge entries
-  - **System Status:** Gmail watch status, DB health, whitelist
-  - **Settings:** configurable fonts and other options
+### 3.4 Reply Delivery (FR-400)
 
-### 3.8 Configuration (FR-08)
-- **FR-08.1:** App-wide configuration SHALL be stored in `app_config` table (key-value with category)
-- **FR-08.2:** Font configuration SHALL be editable from the Settings page
-- **FR-08.3:** Changes SHALL take effect on the next form processed
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR-401 | System SHALL reply to the sender with the filled PDF attached | Must |
+| FR-402 | System SHALL thread the reply to the original email | Should |
+| FR-403 | System SHALL send error notifications on processing failure | Must |
+| FR-404 | System SHALL send explanatory replies for intake drops | Must |
 
-- Prompt injection security filter scans all email content before LLM processing
-- Bilingual pattern detection (English + Hebrew) with risk scoring
+### 3.5 Security (FR-500)
 
-### 4.2 Reliability (NFR-02)
-- Gmail watch subscription auto-renewed every 6 days
-- All processing events logged to database regardless of outcome
-- Error logging with type categorization for debugging
-- System health monitoring with database connectivity checks
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR-501 | System SHALL authenticate webhook requests with bearer token | Must |
+| FR-502 | System SHALL scan email content for prompt injection attacks | Must |
+| FR-503 | System SHALL detect Hebrew and English injection patterns | Must |
+| FR-504 | System SHALL block emails exceeding risk score threshold | Must |
+| FR-505 | System SHALL execute generated code in a restricted namespace | Must |
+| FR-506 | System SHALL rewrite file paths in generated code to safe locations | Must |
 
-### 4.3 Performance (NFR-03)
-- Form processing target: < 60 seconds per form
-- Dashboard page loads: < 3 seconds
-- Database queries optimized with indexes on frequently queried columns
+### 3.6 Dashboard (FR-600)
 
-### 4.4 Maintainability (NFR-04)
-- Knowledge store editable without code changes
-- Font configuration changeable from UI
-- Modular daemon architecture (separate watch renewal + processing tasks)
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR-601 | Dashboard SHALL require Google SSO authentication | Must |
+| FR-602 | Dashboard SHALL display processing activity log | Must |
+| FR-603 | Dashboard SHALL show processing statistics and charts | Should |
+| FR-604 | Dashboard SHALL provide error tracking with CSV export | Should |
+| FR-605 | Dashboard SHALL allow knowledge base management (CRUD) | Must |
+| FR-606 | Dashboard SHALL show system health status | Must |
+| FR-607 | Dashboard SHALL display Cloudflare email intake analytics | Should |
+| FR-608 | Dashboard SHALL provide E2E pipeline health tests | Should |
+
+### 3.7 Logging & Monitoring (FR-700)
+
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR-701 | System SHALL log every processing attempt to Firestore | Must |
+| FR-702 | Logs SHALL include: sender, subject, status, timing, target person | Must |
+| FR-703 | System SHALL store filled PDFs in Cloud Storage | Must |
+| FR-704 | System SHALL track processing time for each request | Should |
 
 ---
 
-## 5. External Integrations
+## 4. Non-Functional Requirements
 
-| Service | Purpose | Credentials |
-|---------|---------|-------------|
-| Gmail API | Read emails, send replies, manage watch | OAuth2 (gmailuser) |
-| Google Cloud Pub/Sub | Real-time email notifications | Project: form-claw, Topic: gmail-formbot |
-| Abacus.AI RouteLLM | Form analysis, field mapping, OCR processing | ABACUSAI_API_KEY |
-| Google OAuth | Dashboard SSO authentication | GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET |
-| PostgreSQL | Data persistence | DATABASE_URL |
-| LibreOffice | DOC→PDF conversion | System binary (headless) |
-| img2pdf | Image→PDF merging | Python package |
+### 4.1 Performance
 
----
+| ID | Requirement | Target |
+|----|-------------|--------|
+| NFR-101 | Form processing time | < 60 seconds |
+| NFR-102 | Email worker response time | < 5 seconds |
+| NFR-103 | Dashboard page load time | < 3 seconds |
 
-## 6. Data Assets
+### 4.2 Reliability
 
-### 6.1 Family Data
-Stored in Knowledge Store (database) and `/home/ubuntu/shared/family_data.json` (legacy):
-- Family members: Ze'ev (father), Keren (mother), Savyon (daughter), Clil (daughter)
-- IDs, birth dates, addresses, phone numbers, emails
-- School information, medical diagnoses (ASD since 2016)
-- Instruction parsing keywords (Hebrew + English)
+| ID | Requirement | Target |
+|----|-------------|--------|
+| NFR-201 | System availability | 99.5% |
+| NFR-202 | Graceful error handling | Always reply to sender |
+| NFR-203 | Post-deploy E2E smoke tests | On every deployment |
 
-### 6.2 Signature Assets
-- `zr signature nxp.png` — Ze'ev's signature
-- `keren sig.png` — Keren's signature
-- Stored in `/home/ubuntu/shared/` and `/home/ubuntu/Shared/Uploads/`
+### 4.3 Scalability
 
-### 6.3 Font Assets
-- `Playzone.ttf` — English form-filling font
-- `FtPilKahol2.ttf` — Hebrew form-filling font (פיל כחול)
-- Stored in `/home/ubuntu/shared/fonts/` and `public/fonts/`
+| ID | Requirement | Target |
+|----|-------------|--------|
+| NFR-301 | Concurrent processing | Up to 3 instances |
+| NFR-302 | Cold start time | < 30 seconds |
+| NFR-303 | Scale to zero when idle | Yes |
 
----
+### 4.4 Security
 
-## 7. User Stories
-
-| ID | As a... | I want to... | So that... |
-|----|---------|-------------|------------|
-| US-01 | Parent | Forward a school form to formfill@20032014.xyz | The form is automatically filled and returned |
-| US-02 | Parent | Specify "for Savyon by Keren" in email subject | The correct child and signer are used |
-| US-03 | Parent | View processing history on dashboard | I can track which forms were processed |
-| US-04 | Parent | See error details when processing fails | I can understand and resolve issues |
-| US-05 | Parent | Edit knowledge entries on dashboard | I can correct or add family information |
-| US-06 | Parent | Change the form-filling font | Different fonts can be used for different needs |
-| US-07 | System | Auto-learn from clarification emails | Knowledge base grows over time without manual entry |
-| US-08 | Parent | Export error logs as CSV | I can analyze issues offline |
+| ID | Requirement | Target |
+|----|-------------|--------|
+| NFR-401 | Webhook authentication | Bearer token |
+| NFR-402 | Dashboard authentication | Google SSO |
+| NFR-403 | Prompt injection detection | Block at ≥70% risk |
+| NFR-404 | Code execution isolation | Restricted namespace |
 
 ---
 
-## 8. Acceptance Criteria
+## 5. Data Requirements
 
-1. Email with PDF attachment → filled PDF reply within 60 seconds
-2. Email with DOC attachment → converted to PDF, filled, replied
-3. Email with multiple images → merged into PDF, OCR'd, filled, replied
-4. Email with Hebrew instructions → correct child/signer override
-5. Dashboard shows real-time processing logs after each form
-6. Knowledge base seeded with all family data, editable inline
-7. Font configuration saved and persisted across sessions
-8. Only whitelisted emails can access dashboard and trigger processing
-9. Gmail watch stays active (auto-renewed every 6 days)
-10. All errors logged with categorization and exportable
+### 5.1 Family Data (`family_data.json`)
+
+- Family members: name (Hebrew/English), ID, birth date, contact info
+- Address: street, city, ZIP (Hebrew/English)
+- Medical: diagnosis, doctor, HMO
+- School information per child
+- Instruction parsing keywords (Hebrew/English)
+
+### 5.2 Knowledge Base (Firestore)
+
+- Key-value entries per person or family-wide
+- Categories: medical, educational, administrative
+- CRUD operations via dashboard
+
+### 5.3 Processing Logs (Firestore)
+
+- One document per processing attempt
+- Fields: sender, subject, status, target person, timing, error details
+- Filled PDF path in GCS
+
+---
+
+## 6. Interface Requirements
+
+### 6.1 Email Interface
+
+- **Input:** Email with PDF or image attachment(s)
+- **Supported formats:** PDF, JPG, PNG, WEBP, HEIC
+- **Instructions:** Subject line and/or body text in Hebrew or English
+- **Output:** Reply email with filled PDF attachment
+
+### 6.2 Dashboard Interface
+
+- **URL:** https://formclaw.savlil.com
+- **Auth:** Google SSO (whitelisted accounts)
+- **Pages:** Dashboard, Activity, Statistics, Errors, Knowledge, System
+- **Responsive:** Desktop-optimized
+
+### 6.3 Processor API
+
+- **Endpoint:** POST /webhook
+- **Auth:** Bearer token
+- **Health:** GET /health
+- **Format:** JSON request/response

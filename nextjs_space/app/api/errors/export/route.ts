@@ -3,39 +3,36 @@ export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
-import { prisma } from '@/lib/prisma';
+import { getDb, COLLECTIONS, toDate } from '@/lib/firestore';
 
-export async function GET(req: NextRequest) {
-  try {
-    const session = await getServerSession(authOptions);
-    if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+export async function GET(request: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-    const errors = await prisma.formProcessingLog.findMany({
-      where: { processing_status: 'failed' },
-      orderBy: { received_at: 'desc' },
-    }).catch(() => []);
+  const db = getDb();
+  const snapshot = await db.collection(COLLECTIONS.LOGS)
+    .where('processing_status', '==', 'failed')
+    .orderBy('received_at', 'desc')
+    .get();
 
-    const safeErrors = (errors as any[]) ?? [];
-    const headers = ['Timestamp', 'Sender Email', 'Subject', 'Error Type', 'Error Message', 'Target Person'];
-    const rows = safeErrors?.map?.((e: any) => [
-      e?.received_at?.toISOString?.() ?? '',
-      e?.sender_email ?? '',
-      (e?.subject ?? '')?.replace?.(/,/g, ';') ?? '',
-      e?.error_type ?? '',
-      (e?.error_message ?? '')?.replace?.(/,/g, ';')?.replace?.(/\n/g, ' ') ?? '',
-      e?.target_person ?? '',
-    ]?.join(',')) ?? [];
+  const csvRows = ['Timestamp,Sender Email,Subject,Error Type,Error Message,Target Person'];
+  snapshot.docs.forEach(doc => {
+    const d = doc.data();
+    const escape = (s: string) => `"${(s || '').replace(/"/g, '""')}"`;
+    csvRows.push([
+      toDate(d.received_at)?.toISOString() || '',
+      escape(d.sender_email || ''),
+      escape(d.subject || ''),
+      escape(d.error_type || 'Unknown'),
+      escape(d.error_message || ''),
+      escape(d.target_person || ''),
+    ].join(','));
+  });
 
-    const csv = [headers?.join(','), ...(rows ?? [])]?.join?.('\n') ?? '';
-
-    return new NextResponse(csv, {
-      headers: {
-        'Content-Type': 'text/csv',
-        'Content-Disposition': 'attachment; filename=error_logs.csv',
-      },
-    });
-  } catch (error: any) {
-    console.error('CSV export error:', error);
-    return NextResponse.json({ error: 'Failed to export' }, { status: 500 });
-  }
+  return new NextResponse(csvRows.join('\n'), {
+    headers: {
+      'Content-Type': 'text/csv',
+      'Content-Disposition': 'attachment; filename=error_logs.csv',
+    },
+  });
 }

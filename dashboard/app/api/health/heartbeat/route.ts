@@ -26,7 +26,7 @@ export async function POST(req: NextRequest) {
     }
 
     const now = new Date();
-    const statusRef = db.collection(COLLECTIONS.SYSTEM_STATUS).doc('current');
+    const statusRef = db.collection(COLLECTIONS.SYSTEM).doc('current');
     const statusDoc = await statusRef.get();
 
     const updateData: Record<string, any> = {

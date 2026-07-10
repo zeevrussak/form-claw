@@ -3,51 +3,48 @@ export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
-import { prisma } from '@/lib/prisma';
+import { getDb, COLLECTIONS } from '@/lib/firestore';
 
-export async function GET(req: NextRequest) {
-  try {
-    const session = await getServerSession(authOptions);
-    if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+export async function GET(request: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-    const { searchParams } = new URL(req.url);
-    const category = searchParams.get('category');
+  const category = request.nextUrl.searchParams.get('category');
+  const db = getDb();
+  let query: FirebaseFirestore.Query = db.collection(COLLECTIONS.CONFIG);
 
-    const where = category ? { category } : {};
-    const configs = await prisma.appConfig.findMany({ where, orderBy: { key: 'asc' } });
-
-    return NextResponse.json({ configs });
-  } catch (error) {
-    console.error('Config GET error:', error);
-    return NextResponse.json({ error: 'Failed to fetch config' }, { status: 500 });
+  if (category) {
+    query = query.where('category', '==', category);
   }
+
+  const snapshot = await query.get();
+  const configs = snapshot.docs.map(doc => ({
+    id: doc.id,
+    key: doc.id, // doc ID is the key
+    ...doc.data(),
+  }));
+
+  return NextResponse.json(configs);
 }
 
-export async function PUT(req: NextRequest) {
-  try {
-    const session = await getServerSession(authOptions);
-    if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+export async function PUT(request: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-    const body = await req.json();
-    const { configs } = body as { configs: { key: string; value: string; label?: string; category?: string }[] };
+  const { configs } = await request.json();
+  const db = getDb();
 
-    if (!configs || !Array.isArray(configs)) {
-      return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
-    }
-
-    const results = await Promise.all(
-      configs.map((c) =>
-        prisma.appConfig.upsert({
-          where: { key: c.key },
-          update: { value: c.value, ...(c.label ? { label: c.label } : {}), ...(c.category ? { category: c.category } : {}) },
-          create: { key: c.key, value: c.value, label: c.label || c.key, category: c.category || 'general' },
-        })
-      )
-    );
-
-    return NextResponse.json({ configs: results });
-  } catch (error) {
-    console.error('Config PUT error:', error);
-    return NextResponse.json({ error: 'Failed to update config' }, { status: 500 });
+  const batch = db.batch();
+  for (const cfg of configs) {
+    const ref = db.collection(COLLECTIONS.CONFIG).doc(cfg.key);
+    batch.set(ref, {
+      value: cfg.value,
+      label: cfg.label || null,
+      category: cfg.category || 'general',
+      updated_at: new Date(),
+    }, { merge: true });
   }
+  await batch.commit();
+
+  return NextResponse.json({ success: true });
 }
