@@ -44,6 +44,8 @@ export const COLLECTIONS = {
   CONFIG: 'app_config',
   SYSTEM: 'system_status',
   USERS: 'users',
+  TEAMS: 'teams',
+  APPROVED_EMAILS: 'approved_emails',
 } as const;
 
 // Helper to convert Firestore Timestamp to Date

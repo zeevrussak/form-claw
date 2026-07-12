@@ -221,13 +221,7 @@ async def process_form(request: Request):
         if filled_pdf is None:
             raise RuntimeError("All fill attempts failed")
 
-        # ----- Upload to Cloud Storage -----
-        bucket = storage.Client().bucket(GCS_BUCKET)
-        blob_name = f"filled/{log_ref.id}_{pdf_filename}"
-        blob = bucket.blob(blob_name)
-        blob.upload_from_string(filled_pdf, content_type="application/pdf")
-
-        # ----- Reply via Resend -----
+        # ----- Reply via Resend (no document retention) -----
         reply_headers = []
         if in_reply_to or message_id:
             reply_headers.append({"name": "In-Reply-To", "value": in_reply_to or message_id})
@@ -257,7 +251,7 @@ async def process_form(request: Request):
             "converted_from_images": converted_from_images,
             "image_count": len(image_attachments) if converted_from_images else 0,
             "page_count": len(page_images),
-            "filled_pdf_path": blob_name,
+            "filled_pdf_path": None,  # Documents not retained after processing
             "processing_time_seconds": round(elapsed, 2),
             "processing_completed_at": datetime.now(timezone.utc),
             "llm_provider": f"google/{GEMINI_MODEL}",

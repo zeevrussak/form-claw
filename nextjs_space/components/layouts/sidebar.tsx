@@ -15,6 +15,9 @@ import {
   LogOut,
   Shield,
   ChevronRight,
+  Users,
+  Brain,
+  Settings,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -25,7 +28,10 @@ const navItems = [
   { href: '/activity', label: 'Activity Log', icon: Activity },
   { href: '/statistics', label: 'Statistics', icon: BarChart3 },
   { href: '/errors', label: 'Error Log', icon: AlertCircle },
-  { href: '/system', label: 'System Status', icon: Server },
+  { href: '/knowledge', label: 'Knowledge Base', icon: Brain },
+  { href: '/team', label: 'Team', icon: Users },
+  { href: '/settings', label: 'Settings', icon: Settings },
+  { href: '/system', label: 'System', icon: Server },
 ];
 
 export function Sidebar() {

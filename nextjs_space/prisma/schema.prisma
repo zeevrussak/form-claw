@@ -9,6 +9,20 @@ datasource db {
     url      = env("DATABASE_URL")
 }
 
+model Team {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?
+  members     User[]
+  knowledge   KnowledgeEntry[]
+  approvedEmails ApprovedEmail[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("teams")
+}
+
 model User {
   id            String    @id @default(cuid())
   name          String?
@@ -17,10 +31,28 @@ model User {
   image         String?
   password      String?
   role          String    @default("user")
+  teamId        String?
+  team          Team?     @relation(fields: [teamId], references: [id])
   accounts      Account[]
   sessions      Session[]
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
+
+  @@index([teamId])
+}
+
+model ApprovedEmail {
+  id        String   @id @default(cuid())
+  email     String
+  label     String?
+  teamId    String?
+  team      Team?    @relation(fields: [teamId], references: [id])
+  addedBy   String?
+  createdAt DateTime @default(now())
+
+  @@unique([email, teamId])
+  @@index([teamId])
+  @@map("approved_emails")
 }
 
 model Account {
@@ -111,12 +143,15 @@ model KnowledgeEntry {
   language        String   @default("both")
   appliesToPerson String?
   isActive        Boolean  @default(true)
+  teamId          String?
+  team            Team?    @relation(fields: [teamId], references: [id])
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
   @@index([category])
   @@index([appliesToPerson])
   @@index([isActive])
+  @@index([teamId])
   @@map("knowledge_entries")
 }
 

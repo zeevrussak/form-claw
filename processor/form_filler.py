@@ -8,9 +8,7 @@ Assets (fonts, signatures) are loaded from local paths or GCS.
 
 import io
 import os
-import sys
 import logging
-import tempfile
 from pathlib import Path
 
 log = logging.getLogger("formclaw.filler")
@@ -35,12 +33,32 @@ def execute_fill_code(code: str, pdf_bytes: bytes, family_data: dict) -> bytes:
     # Rewrite asset paths to point to container-local files
     code = rewrite_asset_paths(code)
 
-    # Build execution namespace with allowed imports
+    # Build execution namespace with restricted builtins (sandbox)
+    _SAFE_BUILTINS = {
+        # Types
+        'True': True, 'False': False, 'None': None,
+        'int': int, 'float': float, 'str': str, 'bytes': bytes,
+        'bool': bool, 'list': list, 'dict': dict, 'tuple': tuple,
+        'set': set, 'frozenset': frozenset, 'bytearray': bytearray,
+        # Functions
+        'len': len, 'range': range, 'enumerate': enumerate, 'zip': zip,
+        'map': map, 'filter': filter, 'sorted': sorted, 'reversed': reversed,
+        'min': min, 'max': max, 'sum': sum, 'abs': abs, 'round': round,
+        'isinstance': isinstance, 'issubclass': issubclass, 'type': type,
+        'hasattr': hasattr, 'getattr': getattr, 'setattr': setattr,
+        'print': print, 'repr': repr, 'id': id, 'hash': hash,
+        'iter': iter, 'next': next, 'callable': callable,
+        'chr': chr, 'ord': ord, 'hex': hex,
+        'ValueError': ValueError, 'TypeError': TypeError,
+        'KeyError': KeyError, 'IndexError': IndexError,
+        'RuntimeError': RuntimeError, 'Exception': Exception,
+        'StopIteration': StopIteration,
+        'super': super, 'property': property, 'staticmethod': staticmethod,
+        'classmethod': classmethod, 'object': object,
+    }
     namespace = {
-        "__builtins__": __builtins__,
+        "__builtins__": _SAFE_BUILTINS,
         "io": io,
-        "os": os,
-        "sys": sys,
     }
 
     # Execute the code to define fill_form()
