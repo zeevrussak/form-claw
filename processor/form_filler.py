@@ -18,6 +18,45 @@ ASSETS_DIR = Path(os.environ.get("ASSETS_DIR", "/app/assets"))
 FONTS_DIR = ASSETS_DIR / "fonts"
 SIGNATURES_DIR = ASSETS_DIR / "signatures"
 
+# Modules the LLM-generated fill code is allowed to import.
+# Kept to what's needed for PDF form filling (ReportLab + PyPDF2 + imaging)
+# plus common stdlib helpers. Any submodule of these is also permitted
+# (e.g. "reportlab.pdfgen.canvas", "PIL.Image").
+_ALLOWED_IMPORTS = frozenset({
+    # Core PDF / imaging stack
+    "reportlab", "PyPDF2", "pypdf", "PIL", "pillow_heif", "fitz",
+    # I/O and math
+    "io", "os", "math", "decimal", "fractions", "random", "statistics",
+    # Text / data helpers
+    "re", "json", "csv", "string", "textwrap", "base64", "binascii",
+    "unicodedata", "html",
+    # Date / time
+    "datetime", "time", "calendar",
+    # Collections / functional
+    "collections", "itertools", "functools", "operator", "copy",
+    "typing", "dataclasses", "enum", "types", "abc", "numbers",
+    "bisect", "heapq", "array",
+})
+
+
+def _make_safe_import():
+    """
+    Build a restricted ``__import__`` for the sandbox.
+
+    Standard ``import`` statements in the generated code call this. It allows
+    modules whose top-level package is in ``_ALLOWED_IMPORTS`` (and any of
+    their submodules) and blocks everything else.
+    """
+    _real_import = __import__
+
+    def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+        root = name.split(".", 1)[0] if name else name
+        if root not in _ALLOWED_IMPORTS:
+            raise ImportError(f"import of '{name}' is not allowed in the sandbox")
+        return _real_import(name, globals, locals, fromlist, level)
+
+    return _safe_import
+
 
 def execute_fill_code(code: str, pdf_bytes: bytes, family_data: dict) -> bytes:
     """
@@ -35,6 +74,9 @@ def execute_fill_code(code: str, pdf_bytes: bytes, family_data: dict) -> bytes:
 
     # Build execution namespace with restricted builtins (sandbox)
     _SAFE_BUILTINS = {
+        # Import machinery — required for standard `import` statements.
+        # Restricted to a whitelist of modules via _make_safe_import().
+        '__import__': _make_safe_import(),
         # Types
         'True': True, 'False': False, 'None': None,
         'int': int, 'float': float, 'str': str, 'bytes': bytes,
