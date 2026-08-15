@@ -1,0 +1,59 @@
+name: Deploy Dashboard
+
+# Invoke this manually from the GitHub UI:
+#   Actions -> "Deploy Dashboard" -> "Run workflow"
+# It also runs automatically on pushes to main that touch dashboard/**.
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for deployment'
+        required: false
+        default: 'Manual deploy'
+  push:
+    branches: [main]
+    paths: ['dashboard/**']
+
+run-name: >-
+  Deploy dashboard ${{ github.event_name == 'workflow_dispatch' && format('({0})', inputs.reason) || '(push)' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: formclaw-dashboard
+          source: ./dashboard
+          region: us-central1
+          project_id: gen-lang-client-0082803425
+          # NOTE: env vars are intentionally NOT set here so that the existing
+          # Cloud Run service env vars (NEXTAUTH_URL, NEXTAUTH_SECRET,
+          # GOOGLE_CLIENT_ID/SECRET, etc.) are preserved across deploys.
+          flags: |
+            --memory=512Mi
+            --cpu=1
+            --timeout=60
+            --min-instances=0
+            --max-instances=3
+            --allow-unauthenticated
+
+      - name: Show deployed URL
+        run: echo "Deployed ${{ steps.deploy.outputs.url || 'formclaw-dashboard' }}"
