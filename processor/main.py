@@ -22,7 +22,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from google.cloud import firestore, storage
 from pdf2image import convert_from_bytes
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from security_filter import scan_email_content
 from form_filler import execute_fill_code
@@ -247,9 +247,10 @@ async def _analyze_generate_fill_and_reply(
     if start_time is None:
         start_time = time.time()
 
-    # ----- Convert PDF pages to images -----
-    page_images = pdf_to_images(pdf_data)
-    log.info(f"Converted {len(page_images)} pages to images")
+    # ----- Convert PDF pages to images (with coordinate-grid overlay so the
+    #       vision model can read exact PDF-point placement coordinates) -----
+    page_images = pdf_to_grid_images(pdf_data)
+    log.info(f"Converted {len(page_images)} pages to grid images")
 
     # ----- LLM Vision Analysis -----
     analysis = await analyze_form(page_images, subject, text_body)
@@ -762,6 +763,58 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 200) -> list[bytes]:
     pil_images = convert_from_bytes(pdf_bytes, dpi=dpi)
     result = []
     for img in pil_images:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        result.append(buf.getvalue())
+    return result
+
+
+def pdf_to_grid_images(pdf_bytes: bytes, dpi: int = 150, step: int = 50) -> list[bytes]:
+    """Convert PDF pages to PNG images with a labeled coordinate-grid overlay.
+
+    The grid labels are in **PDF points** using the PDF coordinate system
+    (origin bottom-left, y increasing upward). This lets the vision model read
+    off exact placement coordinates instead of guessing pixel positions.
+    Vertical (red) lines mark x-points; horizontal (blue) lines mark y-points.
+    """
+    import PyPDF2
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+        dims = [(float(p.mediabox.width), float(p.mediabox.height)) for p in reader.pages]
+    except Exception:
+        dims = []
+    pil_images = convert_from_bytes(pdf_bytes, dpi=dpi)
+    scale = dpi / 72.0
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+    except Exception:
+        try:
+            font = ImageFont.truetype("DejaVuSans-Bold.ttf", 16)
+        except Exception:
+            font = ImageFont.load_default()
+    result = []
+    for idx, img in enumerate(pil_images):
+        if idx < len(dims):
+            w_pts, h_pts = dims[idx]
+        else:
+            w_pts, h_pts = img.width / scale, img.height / scale
+        img = img.convert("RGB")
+        draw = ImageDraw.Draw(img)
+        W, H = img.size
+        x = 0
+        while x <= w_pts:
+            px = x * scale
+            draw.line([(px, 0), (px, H)], fill=(255, 0, 0), width=1)
+            draw.text((px + 2, 2), str(int(x)), fill=(200, 0, 0), font=font)
+            draw.text((px + 2, H - 20), str(int(x)), fill=(200, 0, 0), font=font)
+            x += step
+        y = 0
+        while y <= h_pts:
+            py = (h_pts - y) * scale
+            draw.line([(0, py), (W, py)], fill=(0, 0, 255), width=1)
+            draw.text((2, py + 1), str(int(y)), fill=(0, 0, 200), font=font)
+            draw.text((W - 42, py + 1), str(int(y)), fill=(0, 0, 200), font=font)
+            y += step
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         result.append(buf.getvalue())

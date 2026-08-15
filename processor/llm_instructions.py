@@ -29,6 +29,20 @@ def build_analysis_prompt(subject: str, body: str) -> str:
     """Build the user prompt for form field analysis."""
     return f"""Analyze the attached Hebrew PDF form image(s) for automatic filling.
 
+### Coordinate Grid Overlay (READ THIS FIRST)
+Each image has a **coordinate-grid overlay** drawn on top of it:
+- Thin RED vertical lines mark the **x** coordinate (in PDF points), labeled at
+  the top and bottom edges (0, 50, 100, ...).
+- Thin BLUE horizontal lines mark the **y** coordinate (in PDF points), labeled
+  at the left and right edges (0, 50, 100, ...).
+- These labels are already in the **PDF coordinate system**: origin at the
+  BOTTOM-LEFT, y increasing UPWARD. Read field positions directly off this grid.
+- The red/blue grid lines and their numbers are NOT part of the form — ignore
+  them as content; use them ONLY as a ruler to report accurate coordinates.
+- When you report `x`/`y` for a field, read them from the grid. For a field on
+  an underline, report the `x` where the value should START (right edge for
+  RTL-anchored text) and the `y` of the underline itself.
+
 ### Email Context
 - **Subject:** "{subject}"
 - **Body:** "{body}"
@@ -186,6 +200,21 @@ def fill_form(input_pdf_bytes: bytes, family_data: dict) -> bytes:
   else:
       MISSING_FIELDS.append({{"label": "Father email", "page": 1, "hint": "parent email address"}})
   ```
+- **`val(d, *keys)` takes ONLY dictionary keys and returns `None` if any key is
+  missing. It has NO default argument.** NEVER call `val(family_data, "father",
+  "birth_date", "")` — the trailing `""` is treated as another key, always makes it
+  return `None`, and then `.replace(...)` crashes with `'NoneType' has no attribute`.
+- To resolve-then-transform a value, resolve first, then guard before transforming:
+  ```python
+  bd = val(family_data, "father", "birth_date")   # e.g. "26-08-1979"
+  father_dob = bd.replace("-", "/") if bd else None
+  if father_dob:
+      c.drawString(x, y, father_dob)
+  else:
+      MISSING_FIELDS.append({{"label": "Father date of birth", "page": 1, "hint": "DD-MM-YYYY"}})
+  ```
+- NEVER write a hardcoded personal literal as a fallback (e.g. `... else "20/03/2014"`,
+  `... else "רוסק"`). A missing value stays `None` and goes to `MISSING_FIELDS`.
 - The ONLY literals you may draw are: today's date (given below), and structural
   marks (checkmarks, ellipses). Every personal/data value MUST come from `family_data`.
 - A field left blank because its data is missing is CORRECT behavior. Inventing a
@@ -197,20 +226,68 @@ def fill_form(input_pdf_bytes: bytes, family_data: dict) -> bytes:
 
 #### 1. Architecture
 - Create a ReportLab Canvas overlay for each page.
-- Merge each overlay with the original page using PyPDF2's `PageObject.merge_page()`.
+- **CRITICAL — always call `c.showPage()` before `c.save()` for EVERY page**, even
+  pages where you drew nothing. A canvas with no `showPage()` produces a 0-page PDF,
+  and `overlay_pdf.pages[0]` then raises `IndexError: sequence index out of range`.
+- **CRITICAL — always guard the merge**: only merge when the overlay actually has a
+  page. Use exactly this pattern per page:
+  ```python
+  c.showPage()          # finalize this page's overlay (MANDATORY)
+  c.save()
+  packet.seek(0)
+  overlay_pdf = PyPDF2.PdfReader(packet)
+  if len(overlay_pdf.pages) > 0:
+      page.merge_page(overlay_pdf.pages[0])
+  writer.add_page(page)
+  ```
+- The overlay page size MUST equal the original page's mediabox size (use
+  `float(page.mediabox.width)`, `float(page.mediabox.height)`), so text lands in
+  the right place.
 - Return the final merged PDF as `bytes`.
 
-#### 2. Hebrew Text (RTL)
-- **Always reverse** Hebrew strings before drawing: `text[::-1]`.
-- Use `canvas.drawRightString(x, y, reversed_text)` for Hebrew — this anchors
-  at the RIGHT edge of the field, which is the START in RTL.
+#### 2. Hebrew Text (RTL) — use python-bidi, NOT naive reversal
+- **NEVER use `text[::-1]`.** Naive reversal corrupts embedded numbers: a phone
+  `054-2396119` comes out `9116932-450`, a zip `4334801` comes out `1084334`, and
+  dates/IDs get mangled. This was a real bug — do not reproduce it.
+- **Use the Unicode bidi algorithm** which reverses Hebrew letters but keeps digit
+  and Latin runs in their correct left-to-right order:
+  ```python
+  from bidi.algorithm import get_display
+  def shape_he(text):
+      return get_display(str(text))
+  ```
+- Draw shaped Hebrew right-anchored: `c.drawRightString(x, y, shape_he(text))`.
 - Register the Hebrew font: `pdfmetrics.registerFont(TTFont('Hebrew', 'fonts/FtPilKahol2.ttf'))`
 - Set font: `canvas.setFont('Hebrew', 11)` — adjust size to fit field height.
-- For mixed Hebrew/English content, draw each segment separately.
 
-#### 3. English Text
-- Use `canvas.drawString(x, y, text)` (left-anchored).
-- Font: either built-in `Helvetica` or register `TTFont('English', 'fonts/Playzone.ttf')`.
+#### 2a. Numbers, emails, dates, IDs — draw LTR, NEVER reversed/shaped
+- Phone numbers, ID numbers, zip codes, dates (DD-MM-YYYY), and email addresses
+  are **pure LTR data**. Draw them verbatim with `c.drawString(...)` (or
+  `drawRightString` for right-alignment) using the ORIGINAL string — do NOT pass
+  them through `shape_he` / `get_display` / `[::-1]`. Reversing them is a CRITICAL
+  bug.
+- Only strings that contain Hebrew LETTERS should ever go through `shape_he`.
+
+#### 3. English / Latin / Numeric Text — MUST use a Latin font
+- The Hebrew font (`FtPilKahol2.ttf`) has **NO Latin letters or `@`** — drawing an
+  email or English text with it produces empty boxes (□□□). This is a real bug.
+- Before drawing ANY non-Hebrew string (emails, English text, and to be safe all
+  numbers/dates/IDs), you MUST `canvas.setFont(...)` to a Latin-capable font:
+  built-in `'Helvetica'`, or a registered `TTFont('English', 'fonts/Playzone.ttf')`.
+- Your text-drawing helper must choose the font by content, NOT by a default arg.
+  Make the default safe, e.g.:
+  ```python
+  def draw_text(c, text, x, y, size=10, align="right", is_hebrew=True):
+      if not text: return
+      font = "Hebrew" if is_hebrew else "Helvetica"   # never Hebrew for Latin
+      c.setFont(font, size)
+      s = shape_he(str(text)) if is_hebrew else str(text)
+      (c.drawRightString if align=="right" else
+       c.drawCentredString if align=="center" else c.drawString)(x, y, s)
+  ```
+- Decide `is_hebrew` by whether the string actually contains Hebrew letters
+  (`any('\u0590' <= ch <= '\u05FF' for ch in str(text))`). Emails, phones, IDs,
+  dates and zip codes are NOT Hebrew → `is_hebrew=False` → Latin font, no shaping.
 
 #### 4. ID Number Digit Boxes (תעודת זהות)
 - Israeli IDs are 9 digits. Forms show 9 individual boxes.
@@ -243,40 +320,46 @@ def fill_form(input_pdf_bytes: bytes, family_data: dict) -> bytes:
 - Use the format shown on the form (usually DD/MM/YYYY for Israeli forms).
 - For birth dates, use the data from `family_data`.
 
-#### 9. Coordinate System — CRITICAL
-- PDF origin `(0, 0)` is at the **BOTTOM-LEFT** corner.
-- Y increases upward. Page tops are typically ~842pt (A4) or ~792pt (Letter).
-- **ALWAYS** read actual page dimensions from `page.mediabox`:
+#### 9. Coordinate System — CRITICAL (grid-calibrated)
+- PDF origin `(0, 0)` is at the **BOTTOM-LEFT** corner. Y increases upward.
+- **The form images have a coordinate-grid overlay drawn on them**: RED vertical
+  lines = x in PDF points (labeled top & bottom); BLUE horizontal lines = y in
+  PDF points (labeled left & right). These labels ARE the PDF coordinate system
+  (bottom-left origin, y-up). The `x`/`y` values in the analysis JSON were read
+  off this grid and are therefore ACCURATE — use them directly. Do NOT invent,
+  rescale, or "correct" them with proportional guesses.
+- The red/blue grid lines are an overlay, NOT part of the form. Never draw them.
+- **ALWAYS** read actual page dimensions from `page.mediabox` (these pages are
+  A4 ≈ 595 x 842 pt):
   ```python
   width = float(page.mediabox.width)
   height = float(page.mediabox.height)
   ```
-- The images you see may not be the same resolution as the PDF. The coordinates in the
-  analysis JSON are APPROXIMATE. You must:
-  1. Read the actual page dimensions from `page.mediabox`.
-  2. Position fields relative to the page dimensions, NOT from hardcoded pixel values.
-  3. For image-sourced PDFs, the page size equals the image size in pixels at 72 DPI.
-     An A4-like image (e.g., ~595x842pt) is typical.
-  4. Use proportional positioning when possible:
-     `x = width * 0.75` for a field 75% from the left.
-- If coordinates from analysis look wrong, use visual landmarks from the form
-  (headers, section breaks) to estimate correct positions.
+- If a coordinate seems off, re-read it against the nearest grid lines in the
+  image — do not fall back to hardcoded pixel values.
 
 #### 9a. Underlined Field Baseline Alignment — CRITICAL
-- For fields with underlines (most Hebrew form fields), the text must sit ON the underline,
-  not float above it.
-- The character **baseline** (bottom of letters, excluding descenders) should align with
-  the underline.
-- If the analysis gives you `y` as the underline position, draw text at `y + 2` to `y + 3`
-  so the baseline rests on the line.
-- Example:
+- For fields with underlines (most Hebrew form fields), the text must sit ON the
+  underline, not float above it and not overlap the label to its right.
+- The analysis `y` for an underlined field is the y of the UNDERLINE. Draw the
+  text baseline **2–3 pt ABOVE** that y so letters rest on the line:
   ```python
-  # Field at underline y=500
-  canvas.drawRightString(x, 502, reversed_hebrew_text)  # baseline on underline
+  underline_y = 550          # read from the blue grid
+  canvas.drawRightString(x, underline_y + 2, shape_he(text))
   ```
-- Test mentally: if the underline is at y=500 and font size is 11pt, the text bottom
-  should touch the line — drawing at y=500 would put it below; y=511 would float above.
-  y=502 puts the baseline right on the line.
+- Horizontal placement — DO NOT OVERLAP THE PRINTED LABEL. Hebrew labels sit to
+  the RIGHT of their blank; the value goes in the empty blank to the LEFT of the
+  label. Anchor with `drawRightString(x_right, ...)` where `x_right` is a few pt
+  to the LEFT of where the label's leftmost character ends. Read the label's left
+  edge off the grid and keep a ~5 pt gap so the value never sits on top of the
+  printed Hebrew label. This was a real defect — leave the label fully readable.
+- Table cells: the printed label sits at the TOP of the cell. Draw the value in
+  the LOWER part of the cell — `drawCentredString(cell_center_x, cell_bottom_y + 3, value)`
+  — so it sits below the label near the bottom rule, NOT over the label text.
+- A couple of stray items in past output were placed far from their field (e.g.
+  a gender circle floating in the margin). Every mark MUST sit on/next to its own
+  field as read from the grid; if unsure of a field's position, omit it rather
+  than dropping it in the wrong place.
 
 #### 10. Text Overflow Prevention
 - **Measure text width** before drawing: `canvas.stringWidth(text, fontName, fontSize)`.

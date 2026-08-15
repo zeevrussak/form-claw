@@ -25,6 +25,8 @@ SIGNATURES_DIR = ASSETS_DIR / "signatures"
 _ALLOWED_IMPORTS = frozenset({
     # Core PDF / imaging stack
     "reportlab", "PyPDF2", "pypdf", "PIL", "pillow_heif", "fitz",
+    # Bidirectional (RTL) text shaping for Hebrew
+    "bidi",
     # I/O and math
     "io", "os", "math", "decimal", "fractions", "random", "statistics",
     # Text / data helpers
@@ -89,11 +91,14 @@ def execute_fill_code(code: str, pdf_bytes: bytes, family_data: dict):
         'len': len, 'range': range, 'enumerate': enumerate, 'zip': zip,
         'map': map, 'filter': filter, 'sorted': sorted, 'reversed': reversed,
         'min': min, 'max': max, 'sum': sum, 'abs': abs, 'round': round,
+        'any': any, 'all': all, 'divmod': divmod, 'pow': pow, 'format': format,
+        'slice': slice, 'complex': complex, 'ascii': ascii,
         'isinstance': isinstance, 'issubclass': issubclass, 'type': type,
         'hasattr': hasattr, 'getattr': getattr, 'setattr': setattr,
+        'delattr': delattr, 'vars': vars, 'dir': dir,
         'print': print, 'repr': repr, 'id': id, 'hash': hash,
         'iter': iter, 'next': next, 'callable': callable,
-        'chr': chr, 'ord': ord, 'hex': hex,
+        'chr': chr, 'ord': ord, 'hex': hex, 'bin': bin, 'oct': oct,
         'ValueError': ValueError, 'TypeError': TypeError,
         'KeyError': KeyError, 'IndexError': IndexError,
         'RuntimeError': RuntimeError, 'Exception': Exception,
