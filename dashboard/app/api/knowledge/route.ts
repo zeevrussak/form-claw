@@ -35,6 +35,7 @@ export async function GET(request: NextRequest) {
       language: d.language || 'both',
       source: d.source || 'manual',
       isActive: d.is_active,
+      createdAt: toDate(d.created_at)?.toISOString() || null,
       updatedAt: toDate(d.updated_at)?.toISOString() || null,
     };
   });

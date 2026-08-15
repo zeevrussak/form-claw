@@ -71,7 +71,12 @@ export async function GET(request: NextRequest) {
     };
   });
 
-  // Client-side search filter (Firestore doesn't support LIKE)
+  // Client-side search filter (Firestore doesn't support LIKE).
+  // KNOWN LIMITATION: this filter runs AFTER pagination, so when a `search`
+  // term is supplied the returned `total`/`totalPages` reflect the unfiltered
+  // count rather than the filtered result set. Firestore has no full-text
+  // search, so a correct count would require a search index (e.g. Algolia) or
+  // loading the entire collection into memory. Left as-is intentionally.
   let filtered = logs;
   if (search) {
     const s = search.toLowerCase();

@@ -17,17 +17,20 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 
 interface OverviewData {
-  totalAll: number;
-  totalSuccess: number;
-  totalFailure: number;
-  successRate: number;
+  total: number;
+  successCount: number;
+  failedCount: number;
+  successRate: number | string;
   todayCount: number;
   todayErrors: number;
-  avgProcessingTime: number;
+  avgProcessingTime: number | string;
 }
 
 interface SystemData {
-  gmailWatch: { active: boolean; expiration: string | null; lastRenewal: string | null };
+  webhookEnabled: boolean;
+  emailSource: string | null;
+  lastCloudflareEmail: string | null;
+  dbConnected: boolean;
   database: { connected: boolean; totalRecords: number };
   lastSuccessfulForm: string | null;
 }
@@ -79,16 +82,16 @@ export function DashboardClient() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatusCard
           icon={<Mail className="h-5 w-5" />}
-          label="Gmail Watch"
-          value={system?.gmailWatch?.active ? 'Active' : 'Inactive'}
-          badge={system?.gmailWatch?.active ? 'success' : 'failure'}
-          sub={`Renewal: ${formatDate(system?.gmailWatch?.lastRenewal)}`}
+          label="Email Intake"
+          value={(system?.webhookEnabled ?? true) ? 'Active' : 'Inactive'}
+          badge={(system?.webhookEnabled ?? true) ? 'success' : 'failure'}
+          sub={`Last email: ${formatDate(system?.lastCloudflareEmail)}`}
           loading={loading}
         />
         <StatusCard
           icon={<FileText className="h-5 w-5" />}
           label="Total Forms Processed"
-          value={String(stats?.totalAll ?? 0)}
+          value={String(stats?.total ?? 0)}
           badge="info"
           sub="All time"
           loading={loading}
@@ -97,8 +100,8 @@ export function DashboardClient() {
           icon={<CheckCircle2 className="h-5 w-5" />}
           label="Success Rate"
           value={`${stats?.successRate ?? 0}%`}
-          badge={(stats?.successRate ?? 0) >= 80 ? 'success' : (stats?.successRate ?? 0) >= 50 ? 'clarification' : 'failure'}
-          sub={`${stats?.totalSuccess ?? 0} succeeded, ${stats?.totalFailure ?? 0} failed`}
+          badge={Number(stats?.successRate ?? 0) >= 80 ? 'success' : Number(stats?.successRate ?? 0) >= 50 ? 'clarification' : 'failure'}
+          sub={`${stats?.successCount ?? 0} succeeded, ${stats?.failedCount ?? 0} failed`}
           loading={loading}
         />
         <StatusCard
@@ -166,13 +169,13 @@ export function DashboardClient() {
             <CardContent className="pt-6">
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="text-sm text-slate-400">Gmail Watch Expiration</p>
+                  <p className="text-sm text-slate-400">Last Email Activity</p>
                   <p className="text-lg font-semibold text-white mt-1">
-                    {loading ? '...' : formatDate(system?.gmailWatch?.expiration)}
+                    {loading ? '...' : formatDate(system?.lastCloudflareEmail)}
                   </p>
                 </div>
                 <Badge variant="outline" className="border-blue-500/30 text-blue-300">
-                  Watch
+                  {system?.emailSource ?? 'Email'}
                 </Badge>
               </div>
             </CardContent>

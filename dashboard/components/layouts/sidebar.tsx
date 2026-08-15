@@ -13,7 +13,6 @@ import {
   Menu,
   X,
   LogOut,
-  Shield,
   ChevronRight,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -60,15 +59,17 @@ export function Sidebar() {
         )}
       >
         {/* Header */}
-        <div className="p-6 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-blue-600/20 border border-blue-500/30 flex items-center justify-center">
-              <Shield className="h-5 w-5 text-blue-400" />
-            </div>
-            <div>
-              <h2 className="font-display font-bold text-white text-lg tracking-tight">Form Claw</h2>
-              <p className="text-[10px] text-blue-300/50 uppercase tracking-widest">Dashboard</p>
-            </div>
+        <div className="p-5 border-b border-white/5 flex items-start justify-between">
+          <div>
+            <Image
+              src="/infiniplex-logo.png"
+              alt="Infiniplex"
+              width={140}
+              height={40}
+              className="object-contain"
+              priority
+            />
+            <p className="text-[10px] text-blue-300/50 uppercase tracking-widest mt-1">Form Claw Dashboard</p>
           </div>
           <button
             onClick={() => setMobileOpen(false)}

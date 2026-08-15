@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { getDb, COLLECTIONS, toDate } from '@/lib/firestore';
+import { WHITELISTED_EMAILS } from '@/lib/whitelist';
 
 export async function GET(request: NextRequest) {
   const session = await getServerSession(authOptions);
@@ -22,6 +23,16 @@ export async function GET(request: NextRequest) {
 
   const lastForm = lastSuccess.empty ? null : toDate(lastSuccess.docs[0].data().received_at)?.toISOString();
 
+  // Database health: count total log records. If this query succeeds, the DB is connected.
+  let dbConnected = true;
+  let totalRecords = 0;
+  try {
+    const countSnap = await db.collection(COLLECTIONS.LOGS).count().get();
+    totalRecords = countSnap.data().count;
+  } catch (e) {
+    dbConnected = false;
+  }
+
   return NextResponse.json({
     webhookEnabled: status.webhook_enabled ?? true,
     emailSource: status.email_source ?? 'cloudflare',
@@ -33,7 +44,9 @@ export async function GET(request: NextRequest) {
         status: status.form_process_status || 'unknown',
       },
     },
-    dbConnected: true,
+    dbConnected,
+    database: { connected: dbConnected, totalRecords },
+    whitelist: WHITELISTED_EMAILS,
   });
 }
 

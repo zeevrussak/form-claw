@@ -41,7 +41,25 @@ interface Log {
   createdAt: string | null;
 }
 
+interface MissingField {
+  label?: string;
+  page?: number;
+  hint?: string;
+}
+
+interface PendingForm {
+  id: string;
+  senderEmail: string | null;
+  subject: string | null;
+  status: string | null;
+  targetPerson: string | null;
+  missingFields: MissingField[];
+  createdAt: string | null;
+  resumedAt: string | null;
+}
+
 export function ActivityClient() {
+  const [view, setView] = useState<'activity' | 'pending'>('activity');
   const [logs, setLogs] = useState<Log[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -50,6 +68,8 @@ export function ActivityClient() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [search, setSearch] = useState('');
   const [selectedLog, setSelectedLog] = useState<Log | null>(null);
+  const [pendingForms, setPendingForms] = useState<PendingForm[]>([]);
+  const [pendingLoading, setPendingLoading] = useState(false);
 
   const fetchLogs = useCallback(async () => {
     setLoading(true);
@@ -72,17 +92,38 @@ export function ActivityClient() {
     }
   }, [page, statusFilter, search]);
 
+  const fetchPending = useCallback(async () => {
+    setPendingLoading(true);
+    try {
+      const res = await fetch('/api/pending');
+      const data = await res?.json?.();
+      setPendingForms(data?.forms ?? []);
+    } catch (e: any) {
+      console.error('Fetch pending error:', e);
+    } finally {
+      setPendingLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
-    fetchLogs();
-  }, [fetchLogs]);
+    if (view === 'activity') {
+      fetchLogs();
+    } else {
+      fetchPending();
+    }
+  }, [view, fetchLogs, fetchPending]);
 
   const statusBadge = (status: string) => {
     const s = status?.toLowerCase?.() ?? '';
     const map: Record<string, string> = {
       completed: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
+      success: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
+      resumed: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
       failed: 'bg-red-500/20 text-red-300 border-red-500/30',
       processing: 'bg-blue-500/20 text-blue-300 border-blue-500/30',
+      dropped: 'bg-slate-500/20 text-slate-300 border-slate-500/30',
       pending: 'bg-amber-500/20 text-amber-300 border-amber-500/30',
+      awaiting_reply: 'bg-amber-500/20 text-amber-300 border-amber-500/30',
       clarification: 'bg-amber-500/20 text-amber-300 border-amber-500/30',
     };
     return map[s] ?? map.pending;
@@ -103,6 +144,34 @@ export function ActivityClient() {
         <p className="text-slate-400 mt-1">Recent form processing events</p>
       </div>
 
+      {/* Tab switcher */}
+      <div className="flex items-center gap-2 border-b border-white/10">
+        <button
+          onClick={() => setView('activity')}
+          className={
+            'px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px ' +
+            (view === 'activity'
+              ? 'border-blue-400 text-white'
+              : 'border-transparent text-slate-400 hover:text-white')
+          }
+        >
+          Activity Log
+        </button>
+        <button
+          onClick={() => setView('pending')}
+          className={
+            'px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px ' +
+            (view === 'pending'
+              ? 'border-blue-400 text-white'
+              : 'border-transparent text-slate-400 hover:text-white')
+          }
+        >
+          Pending Forms
+        </button>
+      </div>
+
+      {view === 'activity' && (
+      <>
       {/* Filters */}
       <Card className="bg-white/5 border-white/10">
         <CardContent className="pt-6">
@@ -123,9 +192,11 @@ export function ActivityClient() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All Status</SelectItem>
-                <SelectItem value="completed">Completed</SelectItem>
+                <SelectItem value="success">Completed ✓</SelectItem>
                 <SelectItem value="failed">Failed</SelectItem>
                 <SelectItem value="processing">Processing</SelectItem>
+                <SelectItem value="dropped">Dropped</SelectItem>
+                <SelectItem value="awaiting_reply">Awaiting Reply</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -203,6 +274,70 @@ export function ActivityClient() {
           </div>
         </div>
       </Card>
+      </>
+      )}
+
+      {view === 'pending' && (
+      <Card className="bg-white/5 border-white/10 overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-white/10">
+                <th className="text-left p-4 text-slate-400 font-medium">Timestamp</th>
+                <th className="text-left p-4 text-slate-400 font-medium">Sender</th>
+                <th className="text-left p-4 text-slate-400 font-medium">Subject</th>
+                <th className="text-left p-4 text-slate-400 font-medium">Target</th>
+                <th className="text-left p-4 text-slate-400 font-medium">Missing Fields</th>
+                <th className="text-left p-4 text-slate-400 font-medium">Status</th>
+                <th className="text-left p-4 text-slate-400 font-medium">Resumed At</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pendingLoading ? (
+                Array.from({ length: 5 })?.map?.((_: any, i: number) => (
+                  <tr key={i} className="border-b border-white/5">
+                    {Array.from({ length: 7 })?.map?.((__: any, j: number) => (
+                      <td key={j} className="p-4"><div className="h-4 bg-white/5 rounded animate-pulse" /></td>
+                    ))}
+                  </tr>
+                ))
+              ) : (pendingForms?.length ?? 0) === 0 ? (
+                <tr>
+                  <td colSpan={7} className="p-8 text-center text-slate-500">No pending forms</td>
+                </tr>
+              ) : (
+                pendingForms?.map?.((form: PendingForm) => (
+                  <tr key={form?.id} className="border-b border-white/5 hover:bg-white/[0.03] transition-colors">
+                    <td className="p-4 text-slate-300 font-mono text-xs whitespace-nowrap">{formatTime(form?.createdAt)}</td>
+                    <td className="p-4 text-slate-300 truncate max-w-[150px]">{form?.senderEmail ?? '-'}</td>
+                    <td className="p-4 text-white truncate max-w-[200px]">{form?.subject ?? '-'}</td>
+                    <td className="p-4 text-slate-300">{form?.targetPerson ?? '-'}</td>
+                    <td className="p-4 text-slate-300">
+                      {(form?.missingFields?.length ?? 0) === 0 ? (
+                        <span className="text-slate-500">-</span>
+                      ) : (
+                        <span className="text-slate-300">
+                          {form.missingFields.map((f: MissingField) => f?.label ?? '').filter(Boolean).join(', ')}
+                        </span>
+                      )}
+                    </td>
+                    <td className="p-4">
+                      <Badge variant="outline" className={statusBadge(form?.status ?? '')}>
+                        {form?.status ?? 'unknown'}
+                      </Badge>
+                    </td>
+                    <td className="p-4 text-slate-300 font-mono text-xs whitespace-nowrap">{formatTime(form?.resumedAt)}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="flex items-center justify-between p-4 border-t border-white/10">
+          <p className="text-sm text-slate-500">{pendingForms?.length ?? 0} pending forms</p>
+        </div>
+      </Card>
+      )}
 
       {/* Detail Modal */}
       {selectedLog && (
