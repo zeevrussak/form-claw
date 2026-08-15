@@ -231,6 +231,22 @@ def fill_form(input_pdf_bytes: bytes, family_data: dict) -> bytes:
 - If coordinates from analysis look wrong, use visual landmarks from the form
   (headers, section breaks) to estimate correct positions.
 
+#### 9a. Underlined Field Baseline Alignment — CRITICAL
+- For fields with underlines (most Hebrew form fields), the text must sit ON the underline,
+  not float above it.
+- The character **baseline** (bottom of letters, excluding descenders) should align with
+  the underline.
+- If the analysis gives you `y` as the underline position, draw text at `y + 2` to `y + 3`
+  so the baseline rests on the line.
+- Example:
+  ```python
+  # Field at underline y=500
+  canvas.drawRightString(x, 502, reversed_hebrew_text)  # baseline on underline
+  ```
+- Test mentally: if the underline is at y=500 and font size is 11pt, the text bottom
+  should touch the line — drawing at y=500 would put it below; y=511 would float above.
+  y=502 puts the baseline right on the line.
+
 #### 10. Text Overflow Prevention
 - **Measure text width** before drawing: `canvas.stringWidth(text, fontName, fontSize)`.
 - If text is wider than the field, **reduce font size** iteratively until it fits.
@@ -247,13 +263,31 @@ def fill_form(input_pdf_bytes: bytes, family_data: dict) -> bytes:
 - Use `try/except` for robustness.
 - Add brief inline comments for coordinate placements.
 
-#### 13. CRITICAL: Actually Fill the Fields
+#### 13. CRITICAL: Actually Fill the Fields — EVERY SINGLE ONE
 - You MUST fill ALL identified fields with the correct data from `family_data`.
-- Do not return a function that only draws a date — fill EVERY field:
-  parent name, child name, ID number, address, phone, signature, checkboxes, etc.
+- **ITERATE through EVERY field** in the analysis JSON pages array and generate
+  a drawing command for each one. Do not skip fields.
+- Do not return a function that only draws header info (date, ID, email at top) — 
+  fill EVERY field on EVERY page:
+  - Parent names (father, mother) in ALL locations they appear
+  - Child name, ID number, birth date in ALL locations
+  - Address, postal code, city in ALL locations  
+  - Phone numbers (home, mobile, work) for both parents in ALL locations
+  - Email addresses in ALL locations
+  - Health declaration checkboxes (allergies, medications, conditions)
+  - Consent checkboxes (trip permission, photo permission, etc.)
+  - Signature fields (father, mother, date)
+  - Emergency contact details
+  - Any "other" or notes fields
 - Match the target person to the correct child in `family_data["children"]`.
 - Match the signer to `family_data["father"]` or `family_data["mother"]`.
-- For each field, determine the correct value from family_data and draw it.
+- For each field in the analysis:
+  1. Determine the correct value from family_data
+  2. Calculate the position (adjust Y for baseline alignment as per rule 9a)
+  3. Generate the drawString/drawRightString/drawImage/checkbox command
+- **Field coverage requirement**: Your generated code must draw to at least 80% of
+  the fields identified in the analysis. If you can't determine a value for a field,
+  leave it blank rather than crash, but attempt to fill it.
 - Test your coordinate placements mentally: does the parent name land on the
   parent name line? Does the signature land in the signature box?
 - If unsure about exact coordinates, err on the side of reasonable positions
