@@ -158,9 +158,40 @@ def build_code_generation_prompt(
 
 ### Required Function Signature
 ```python
+MISSING_FIELDS = []  # module-level; append dicts for every required field with no data
+
 def fill_form(input_pdf_bytes: bytes, family_data: dict) -> bytes:
     \"\"\"Fill the PDF form and return filled PDF bytes.\"\"\"
 ```
+
+### ⚠️ ABSOLUTE RULE #0 — NEVER INVENT DATA (read first)
+- You may ONLY write a value that is present in `family_data` or the knowledge
+  entries below. **NEVER invent, guess, or use a placeholder/fallback literal.**
+- **FORBIDDEN**: `family_data.get("email", "zeev@russak.com")`,
+  `data.get("zip", "4339210")`, `street = "הפרחים 12"`, or any hard-coded personal
+  value. These caused real bugs where fake emails/addresses were written onto forms.
+- **REQUIRED pattern** — resolve a value, and if it is missing, record it and skip:
+  ```python
+  def val(d, *keys):
+      cur = d
+      for k in keys:
+          if not isinstance(cur, dict) or k not in cur or cur[k] in (None, ""):
+              return None
+          cur = cur[k]
+      return cur
+
+  email = val(family_data, "father", "email")
+  if email:
+      c.drawString(x, y, email)
+  else:
+      MISSING_FIELDS.append({"label": "Father email", "page": 1, "hint": "parent email address"})
+  ```
+- The ONLY literals you may draw are: today's date (given below), and structural
+  marks (checkmarks, ellipses). Every personal/data value MUST come from `family_data`.
+- A field left blank because its data is missing is CORRECT behavior. Inventing a
+  value to fill it is a CRITICAL FAILURE.
+- Do NOT add a field to `MISSING_FIELDS` if it is conditional and its condition is
+  false (e.g. "if allergies, specify:" when there are no allergies) — leave those blank silently.
 
 ### Rules — MUST follow exactly
 
@@ -285,13 +316,15 @@ def fill_form(input_pdf_bytes: bytes, family_data: dict) -> bytes:
   1. Determine the correct value from family_data
   2. Calculate the position (adjust Y for baseline alignment as per rule 9a)
   3. Generate the drawString/drawRightString/drawImage/checkbox command
-- **Field coverage requirement**: Your generated code must draw to at least 80% of
-  the fields identified in the analysis. If you can't determine a value for a field,
-  leave it blank rather than crash, but attempt to fill it.
+- **Field coverage requirement**: For every field that HAS backing data in
+  `family_data`/knowledge, you must draw it (aim for 100% of data-backed fields).
+  For fields with NO backing data, append to `MISSING_FIELDS` and leave blank —
+  see ABSOLUTE RULE #0. Never invent a value to hit a coverage number.
 - Test your coordinate placements mentally: does the parent name land on the
   parent name line? Does the signature land in the signature box?
-- If unsure about exact coordinates, err on the side of reasonable positions
-  rather than leaving fields empty.
+- If unsure about exact COORDINATES (position only), err on the side of reasonable
+  positions. This applies to WHERE text goes, NEVER to WHAT the text says —
+  the value itself must always come from real data.
 
 ### Output
 Return ONLY the Python code inside ```python ... ``` markers.

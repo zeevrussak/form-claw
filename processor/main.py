@@ -172,96 +172,25 @@ async def process_form(request: Request):
             log.info(f"Converted to PDF: {pdf_filename} ({len(pdf_data)} bytes, {len(image_attachments)} image(s))")
 
         source_type = "image" if converted_from_images else "pdf"
+        attachment_count = len(pdf_attachments) + len(image_attachments)
+        image_count = len(image_attachments) if converted_from_images else 0
 
-        # ----- Convert PDF pages to images -----
-        page_images = pdf_to_images(pdf_data)
-        log.info(f"Converted {len(page_images)} pages to images")
-
-        # ----- LLM Vision Analysis -----
-        analysis = await analyze_form(page_images, subject, text_body)
-        target_person = extract_target_person(analysis, subject, text_body)
-        log.info(f"Analysis complete. Target person: {target_person}")
-
-        # ----- Generate fill code -----
-        fill_code = await generate_fill_code(page_images, analysis, target_person)
-        log.info(f"Generated fill code ({len(fill_code)} chars)")
-        # Log first 2000 chars of generated code for debugging
-        log.info(f"Fill code preview:\n{fill_code[:2000]}")
-
-        # ----- Execute fill code (with retry on quality check failure) -----
-        max_attempts = 2
-        filled_pdf = None
-        fill_quality = None
-        for attempt in range(1, max_attempts + 1):
-            try:
-                attempt_code = fill_code if attempt == 1 else await generate_fill_code(page_images, analysis, target_person)
-                if attempt > 1:
-                    log.info(f"Retry attempt {attempt}: regenerated fill code ({len(attempt_code)} chars)")
-                    log.info(f"Retry code preview:\n{attempt_code[:2000]}")
-                    fill_code = attempt_code
-
-                filled_pdf = execute_fill_code(fill_code, pdf_data, FAMILY_DATA)
-                log.info(f"Filled PDF: {len(filled_pdf)} bytes (attempt {attempt})")
-
-                # Quality check: filled PDF should be meaningfully larger than original
-                fill_quality = verify_fill_quality(pdf_data, filled_pdf)
-                log.info(f"Fill quality check: {fill_quality}")
-
-                if fill_quality["passed"]:
-                    break
-                else:
-                    log.warning(f"Fill quality check FAILED (attempt {attempt}): {fill_quality['reason']}")
-                    if attempt < max_attempts:
-                        log.info("Retrying with fresh code generation...")
-            except Exception as e:
-                log.error(f"Fill attempt {attempt} failed: {e}")
-                if attempt >= max_attempts:
-                    raise
-
-        if filled_pdf is None:
-            raise RuntimeError("All fill attempts failed")
-
-        # ----- Reply via Resend (no document retention) -----
-        reply_headers = []
-        if in_reply_to or message_id:
-            reply_headers.append({"name": "In-Reply-To", "value": in_reply_to or message_id})
-            reply_headers.append({"name": "References", "value": references or in_reply_to or message_id})
-
-        resend.Emails.send({
-            "from": RESEND_FROM,
-            "to": [sender],
-            "subject": f"Re: {subject}",
-            "text": f"Filled form attached ({pdf_filename}).\n\nTarget: {target_person}\nProcessed by Form Claw.",
-            "headers": reply_headers if reply_headers else None,
-            "attachments": [{
-                "filename": f"filled_{pdf_filename}",
-                "content": list(filled_pdf),  # Resend SDK expects bytes as list
-            }]
-        })
-        log.info(f"Reply sent to {sender}")
-
-        # ----- Update log -----
-        elapsed = time.time() - start_time
-        log_ref.update({
-            "processing_status": "success",
-            "target_person": target_person,
-            "attachment_filename": pdf_filename,
-            "attachment_count": len(pdf_attachments) + len(image_attachments),
-            "source_type": source_type,
-            "converted_from_images": converted_from_images,
-            "image_count": len(image_attachments) if converted_from_images else 0,
-            "page_count": len(page_images),
-            "filled_pdf_path": None,  # Documents not retained after processing
-            "processing_time_seconds": round(elapsed, 2),
-            "processing_completed_at": datetime.now(timezone.utc),
-            "llm_provider": f"google/{GEMINI_MODEL}",
-            "instructions_detected": text_body.strip()[:500] if text_body.strip() else None,
-            "llm_analysis": analysis[:5000] if analysis else None,
-            "generated_code": fill_code[:5000] if fill_code else None,
-            "fill_quality": fill_quality,
-        })
-
-        return {"status": "success", "id": log_ref.id, "target": target_person, "time": round(elapsed, 2)}
+        return await _analyze_generate_fill_and_reply(
+            pdf_data=pdf_data,
+            pdf_filename=pdf_filename,
+            subject=subject,
+            sender=sender,
+            text_body=text_body,
+            message_id=message_id,
+            in_reply_to=in_reply_to,
+            references=references,
+            log_ref=log_ref,
+            source_type=source_type,
+            converted_from_images=converted_from_images,
+            attachment_count=attachment_count,
+            image_count=image_count,
+            start_time=start_time,
+        )
 
     except Exception as e:
         elapsed = time.time() - start_time
@@ -293,6 +222,411 @@ async def process_form(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Core pipeline: analyze -> generate -> fill -> (reply | ask for missing data)
+# ---------------------------------------------------------------------------
+async def _analyze_generate_fill_and_reply(
+    *,
+    pdf_data: bytes,
+    pdf_filename: str,
+    subject: str,
+    sender: str,
+    text_body: str,
+    message_id: str,
+    in_reply_to: str,
+    references: str,
+    log_ref,
+    source_type: str = "pdf",
+    converted_from_images: bool = False,
+    attachment_count: int = 1,
+    image_count: int = 0,
+    start_time: float = None,
+):
+    """Run the full fill pipeline and either reply with the filled PDF or,
+    if required data is missing, email the sender to ask for it (and store a
+    pending_forms doc so the reply can be resumed)."""
+    if start_time is None:
+        start_time = time.time()
+
+    # ----- Convert PDF pages to images -----
+    page_images = pdf_to_images(pdf_data)
+    log.info(f"Converted {len(page_images)} pages to images")
+
+    # ----- LLM Vision Analysis -----
+    analysis = await analyze_form(page_images, subject, text_body)
+    target_person = extract_target_person(analysis, subject, text_body)
+    log.info(f"Analysis complete. Target person: {target_person}")
+
+    # ----- Generate fill code -----
+    fill_code = await generate_fill_code(page_images, analysis, target_person)
+    log.info(f"Generated fill code ({len(fill_code)} chars)")
+    log.info(f"Fill code preview:\n{fill_code[:2000]}")
+
+    # ----- Execute fill code (with retry on quality check failure) -----
+    max_attempts = 2
+    filled_pdf = None
+    fill_quality = None
+    missing_fields = []
+    for attempt in range(1, max_attempts + 1):
+        try:
+            attempt_code = fill_code if attempt == 1 else await generate_fill_code(page_images, analysis, target_person)
+            if attempt > 1:
+                log.info(f"Retry attempt {attempt}: regenerated fill code ({len(attempt_code)} chars)")
+                log.info(f"Retry code preview:\n{attempt_code[:2000]}")
+                fill_code = attempt_code
+
+            filled_pdf, missing_fields = execute_fill_code(fill_code, pdf_data, FAMILY_DATA)
+            log.info(f"Filled PDF: {len(filled_pdf)} bytes (attempt {attempt}); "
+                     f"{len(missing_fields)} missing field(s)")
+
+            fill_quality = verify_fill_quality(pdf_data, filled_pdf)
+            log.info(f"Fill quality check: {fill_quality}")
+
+            if fill_quality["passed"]:
+                break
+            else:
+                log.warning(f"Fill quality check FAILED (attempt {attempt}): {fill_quality['reason']}")
+                if attempt < max_attempts:
+                    log.info("Retrying with fresh code generation...")
+        except Exception as e:
+            log.error(f"Fill attempt {attempt} failed: {e}")
+            if attempt >= max_attempts:
+                raise
+
+    if filled_pdf is None:
+        raise RuntimeError("All fill attempts failed")
+
+    # ----- If required data is missing, ask the sender instead of sending a
+    #       partially-filled / invented form. -----
+    if missing_fields:
+        log.info(f"{len(missing_fields)} required field(s) missing — requesting from sender")
+        return await _request_missing_fields(
+            pdf_data=pdf_data,
+            pdf_filename=pdf_filename,
+            subject=subject,
+            sender=sender,
+            target_person=target_person,
+            missing_fields=missing_fields,
+            message_id=message_id,
+            in_reply_to=in_reply_to,
+            references=references,
+            log_ref=log_ref,
+            analysis=analysis,
+            start_time=start_time,
+        )
+
+    # ----- Reply via Resend (no document retention) -----
+    reply_headers = []
+    if in_reply_to or message_id:
+        reply_headers.append({"name": "In-Reply-To", "value": in_reply_to or message_id})
+        reply_headers.append({"name": "References", "value": references or in_reply_to or message_id})
+
+    resend.Emails.send({
+        "from": RESEND_FROM,
+        "to": [sender],
+        "subject": f"Re: {subject}",
+        "text": f"Filled form attached ({pdf_filename}).\n\nTarget: {target_person}\nProcessed by Form Claw.",
+        "headers": reply_headers if reply_headers else None,
+        "attachments": [{
+            "filename": f"filled_{pdf_filename}",
+            "content": list(filled_pdf),
+        }]
+    })
+    log.info(f"Reply sent to {sender}")
+
+    elapsed = time.time() - start_time
+    log_ref.update({
+        "processing_status": "success",
+        "target_person": target_person,
+        "attachment_filename": pdf_filename,
+        "attachment_count": attachment_count,
+        "source_type": source_type,
+        "converted_from_images": converted_from_images,
+        "image_count": image_count,
+        "page_count": len(page_images),
+        "filled_pdf_path": None,
+        "processing_time_seconds": round(elapsed, 2),
+        "processing_completed_at": datetime.now(timezone.utc),
+        "llm_provider": f"google/{GEMINI_MODEL}",
+        "instructions_detected": text_body.strip()[:500] if text_body.strip() else None,
+        "llm_analysis": analysis[:5000] if analysis else None,
+        "generated_code": fill_code[:5000] if fill_code else None,
+        "fill_quality": fill_quality,
+    })
+
+    return {"status": "success", "id": log_ref.id, "target": target_person, "time": round(elapsed, 2)}
+
+
+# ---------------------------------------------------------------------------
+# Missing-field request + reply-to-reply resume
+# ---------------------------------------------------------------------------
+import re as _re
+
+
+def _bare_email(addr: str) -> str:
+    """Extract a bare lowercase email address from a From header value."""
+    if not addr:
+        return ""
+    m = _re.search(r"[\w.+-]+@[\w.-]+\.\w+", addr)
+    return (m.group(0).lower() if m else addr.strip().lower())
+
+
+def _normalize_subject(subject: str) -> str:
+    """Strip Re:/Fwd: prefixes and normalize whitespace/case for matching."""
+    s = subject or ""
+    prev = None
+    while prev != s:
+        prev = s
+        s = _re.sub(r"^\s*(re|fw|fwd|תשובה|העברה)\s*:\s*", "", s, flags=_re.IGNORECASE)
+    return _re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _find_pending_form(sender: str, subject: str):
+    """Return (doc_ref, data) of an awaiting-reply pending form matching the
+    sender and (normalized) subject, or (None, None)."""
+    bare = _bare_email(sender)
+    if not bare:
+        return None, None
+    norm = _normalize_subject(subject)
+    docs = list(
+        db.collection("pending_forms")
+        .where("status", "==", "awaiting_reply")
+        .where("sender_email", "==", bare)
+        .stream()
+    )
+    candidates = []
+    for d in docs:
+        data = d.to_dict()
+        if data.get("normalized_subject") == norm or not norm:
+            candidates.append((d.reference, data))
+    if not candidates:
+        # Fall back: any awaiting-reply form from this sender (subject may have drifted)
+        candidates = [(d.reference, d.to_dict()) for d in docs]
+    if not candidates:
+        return None, None
+    # Most recent by created_at
+    candidates.sort(key=lambda t: t[1].get("created_at") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return candidates[0]
+
+
+def _format_missing_fields(missing_fields: list[dict]) -> str:
+    lines = []
+    for i, m in enumerate(missing_fields, 1):
+        label = m.get("label", "?")
+        page = m.get("page")
+        hint = m.get("hint", "")
+        loc = f" (page {page})" if page else ""
+        extra = f" — {hint}" if hint else ""
+        lines.append(f"{i}. {label}{loc}{extra}")
+    return "\n".join(lines)
+
+
+async def _request_missing_fields(
+    *,
+    pdf_data: bytes,
+    pdf_filename: str,
+    subject: str,
+    sender: str,
+    target_person: str,
+    missing_fields: list[dict],
+    message_id: str,
+    in_reply_to: str,
+    references: str,
+    log_ref,
+    analysis: str = "",
+    start_time: float = None,
+):
+    """Store the form as pending and email the sender for the missing values."""
+    if start_time is None:
+        start_time = time.time()
+
+    pending_ref = db.collection("pending_forms").document()
+    bare = _bare_email(sender)
+    norm = _normalize_subject(subject)
+
+    # Stash the original PDF in GCS (avoids Firestore 1MB doc limit)
+    pdf_gcs_path = f"pending/{pending_ref.id}.pdf"
+    try:
+        bucket = storage.Client().bucket(GCS_BUCKET)
+        bucket.blob(pdf_gcs_path).upload_from_string(pdf_data, content_type="application/pdf")
+    except Exception as e:
+        log.error(f"Failed to stash pending PDF in GCS: {e}")
+        pdf_gcs_path = None
+
+    pending_ref.set({
+        "sender_email": bare,
+        "sender_full": sender,
+        "subject": subject,
+        "normalized_subject": norm,
+        "pdf_gcs_path": pdf_gcs_path,
+        "pdf_filename": pdf_filename,
+        "target_person": target_person,
+        "missing_fields": missing_fields,
+        "status": "awaiting_reply",
+        "created_at": datetime.now(timezone.utc),
+        "message_id": message_id,
+        "references": references or in_reply_to or message_id,
+        "log_id": log_ref.id,
+    })
+
+    field_list = _format_missing_fields(missing_fields)
+    reply_text = (
+        f"שלום,\n\n"
+        f"קיבלתי את הטופס (\u200e{pdf_filename}). כדי למלא אותו במלואו חסרים לי הנתונים הבאים. "
+        f"אנא השב/י למייל זה עם הערכים, שורה לכל שדה בפורמט \"שם השדה: ערך\":\n\n"
+        f"{field_list}\n\n"
+        f"לאחר שאקבל את הפרטים אמלא את הטופס ואשלח אותו חזרה.\n"
+        f"— Form Claw Bot\n\n"
+        f"----------------------------------------\n\n"
+        f"Hi,\n\n"
+        f"I received your form ({pdf_filename}). To complete it I'm missing the following "
+        f"information. Please reply to this email with the values, one field per line in the "
+        f"format \"Field: value\":\n\n"
+        f"{field_list}\n\n"
+        f"Once you reply, I'll fill the form and send it back.\n"
+        f"— Form Claw Bot"
+    )
+
+    reply_headers = []
+    if in_reply_to or message_id:
+        reply_headers.append({"name": "In-Reply-To", "value": in_reply_to or message_id})
+        reply_headers.append({"name": "References", "value": references or in_reply_to or message_id})
+
+    try:
+        resend.Emails.send({
+            "from": RESEND_FROM,
+            "to": [sender],
+            "subject": f"Re: {subject} [Missing information needed]",
+            "text": reply_text,
+            "headers": reply_headers if reply_headers else None,
+        })
+        log.info(f"Missing-fields request sent to {sender} ({len(missing_fields)} fields)")
+    except Exception as e:
+        log.error(f"Failed to send missing-fields request: {e}")
+
+    elapsed = time.time() - start_time
+    log_ref.update({
+        "processing_status": "awaiting_reply",
+        "target_person": target_person,
+        "attachment_filename": pdf_filename,
+        "missing_fields": missing_fields,
+        "pending_form_id": pending_ref.id,
+        "processing_time_seconds": round(elapsed, 2),
+        "processing_completed_at": datetime.now(timezone.utc),
+        "llm_analysis": analysis[:5000] if analysis else None,
+    })
+
+    return {
+        "status": "awaiting_reply",
+        "id": log_ref.id,
+        "pending_form_id": pending_ref.id,
+        "missing_fields": [m.get("label") for m in missing_fields],
+    }
+
+
+def _parse_reply_answers(text_body: str) -> list[dict]:
+    """Parse 'Label: value' pairs from a reply body. Ignores quoted history
+    (lines starting with '>') and the bot's own signature block."""
+    answers = []
+    for raw in (text_body or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(">"):
+            continue
+        if line.startswith("--") or line.startswith("—") or line.startswith("____"):
+            break  # signature / quoted separator
+        # Support both ':' and Hebrew maqaf-less "label: value"
+        if ":" in line:
+            label, _, value = line.partition(":")
+        elif "：" in line:  # full-width colon
+            label, _, value = line.partition("：")
+        else:
+            continue
+        label = label.strip()
+        value = value.strip()
+        if label and value and len(label) <= 200:
+            answers.append({"label": label, "value": value[:1000]})
+    return answers
+
+
+def _save_answers_to_knowledge(answers: list[dict], target_person: str):
+    """Persist reply answers to the knowledge base for future forms."""
+    saved = 0
+    for a in answers:
+        try:
+            db.collection("knowledge_entries").add({
+                "key": a["label"],
+                "value": a["value"],
+                "category": "reply-provided",
+                "applies_to_person": target_person if target_person and target_person != "unknown" else None,
+                "is_active": True,
+                "source": "email-reply",
+                "created_at": datetime.now(timezone.utc),
+            })
+            saved += 1
+        except Exception as e:
+            log.warning(f"Failed to save knowledge entry '{a.get('label')}': {e}")
+    log.info(f"Saved {saved}/{len(answers)} reply answers to knowledge base")
+    return saved
+
+
+async def _resume_pending_form(pending_ref, pending: dict, text_body: str, sender: str):
+    """Handle a reply to a missing-fields request: save answers, re-run fill."""
+    answers = _parse_reply_answers(text_body)
+    target_person = pending.get("target_person", "unknown")
+    log.info(f"Resume: parsed {len(answers)} answer line(s) from reply")
+
+    if answers:
+        _save_answers_to_knowledge(answers, target_person)
+
+    # Mark the pending form resolved so it won't match again
+    pending_ref.update({
+        "status": "resumed",
+        "resumed_at": datetime.now(timezone.utc),
+        "reply_answers": answers,
+    })
+
+    # Retrieve the original PDF from GCS
+    pdf_gcs_path = pending.get("pdf_gcs_path")
+    if not pdf_gcs_path:
+        log.error("Pending form has no stored PDF path — cannot resume")
+        return {"status": "error", "reason": "missing stored PDF"}
+    try:
+        bucket = storage.Client().bucket(GCS_BUCKET)
+        pdf_data = bucket.blob(pdf_gcs_path).download_as_bytes()
+    except Exception as e:
+        log.error(f"Failed to retrieve pending PDF from GCS: {e}")
+        return {"status": "error", "reason": f"could not load stored PDF: {e}"}
+
+    subject = pending.get("subject", "")
+    pdf_filename = pending.get("pdf_filename", "form.pdf")
+    references = pending.get("references", "")
+    message_id = pending.get("message_id", "")
+
+    # Fresh processing log for the resumed attempt
+    log_ref = db.collection("form_processing_logs").document()
+    log_ref.set({
+        "received_at": datetime.now(timezone.utc),
+        "sender_email": _bare_email(sender),
+        "subject": subject,
+        "processing_status": "processing",
+        "resumed_from_pending": pending_ref.id,
+        "answers_provided": len(answers),
+    })
+
+    return await _analyze_generate_fill_and_reply(
+        pdf_data=pdf_data,
+        pdf_filename=pdf_filename,
+        subject=subject,
+        sender=sender,
+        text_body="",  # instructions already captured; answers now in knowledge base
+        message_id=message_id,
+        in_reply_to=message_id,
+        references=references,
+        log_ref=log_ref,
+        source_type="pdf",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Intake drop handler
 # ---------------------------------------------------------------------------
 async def _handle_intake_drop(payload: dict):
@@ -300,12 +634,23 @@ async def _handle_intake_drop(payload: dict):
     sender = payload.get("from", "unknown")
     subject = payload.get("subject", "")
     reason = payload.get("reason", "Unknown reason")
-    message_id = payload.get("messageId", "")
-    in_reply_to = payload.get("inReplyTo", "")
+    message_id = payload.get("messageId", payload.get("message_id", ""))
+    in_reply_to = payload.get("inReplyTo", payload.get("in_reply_to", ""))
     references = payload.get("references", "")
+    text_body = payload.get("text_body", payload.get("textBody", payload.get("text", "")))
     attachment_summary = payload.get("attachmentSummary", [])
 
     log.info(f"Intake drop from={sender} subject='{subject}' reason='{reason}'")
+
+    # --- Reply-to-reply: is this an answer to a pending missing-fields request? ---
+    try:
+        pending_ref, pending = _find_pending_form(sender, subject)
+    except Exception as e:
+        log.warning(f"Pending-form lookup failed: {e}")
+        pending_ref, pending = None, None
+    if pending_ref is not None and pending is not None:
+        log.info(f"Matched pending form {pending_ref.id} for {sender} — resuming with reply answers")
+        return await _resume_pending_form(pending_ref, pending, text_body, sender)
 
     # Log to Firestore
     log_ref = db.collection("form_processing_logs").document()
@@ -502,20 +847,33 @@ async def generate_fill_code(
 
 
 async def load_knowledge(target_person: str) -> list[dict]:
-    """Load relevant knowledge entries from Firestore."""
+    """
+    Load relevant knowledge entries from Firestore.
+
+    A form for a child needs the child's data AND both parents' data AND
+    family-wide data (address, family name, HMO). Family-wide entries are
+    stored with applies_to_person == None (not the literal "Family-wide"),
+    and parent entries under the parent's name — so we load ALL active
+    entries and let the LLM use whatever is relevant. The knowledge base is
+    small (tens of entries), so loading everything is cheap and avoids the
+    previous bug where family-wide/parent data was silently dropped.
+    """
     entries = []
     try:
-        # Get entries for this person + family-wide
-        for person_filter in [target_person, "Family-wide"]:
-            docs = (
-                db.collection("knowledge_entries")
-                .where("is_active", "==", True)
-                .where("applies_to_person", "==", person_filter)
-                .stream()
-            )
-            for doc in docs:
-                d = doc.to_dict()
-                entries.append({"key": d.get("key"), "value": d.get("value"), "category": d.get("category")})
+        docs = (
+            db.collection("knowledge_entries")
+            .where("is_active", "==", True)
+            .stream()
+        )
+        for doc in docs:
+            d = doc.to_dict()
+            entries.append({
+                "key": d.get("key"),
+                "value": d.get("value"),
+                "category": d.get("category"),
+                "applies_to_person": d.get("applies_to_person"),
+            })
+        log.info(f"Loaded {len(entries)} active knowledge entries (target={target_person})")
     except Exception as e:
         log.warning(f"Could not load knowledge entries: {e}")
     return entries

@@ -58,14 +58,17 @@ def _make_safe_import():
     return _safe_import
 
 
-def execute_fill_code(code: str, pdf_bytes: bytes, family_data: dict) -> bytes:
+def execute_fill_code(code: str, pdf_bytes: bytes, family_data: dict):
     """
     Execute LLM-generated Python code that defines a fill_form() function.
 
     The code is expected to define:
+        MISSING_FIELDS = []   # module-level, populated during fill_form()
         def fill_form(input_pdf_bytes: bytes, family_data: dict) -> bytes
 
-    Returns the filled PDF as bytes.
+    Returns a tuple: (filled_pdf_bytes, missing_fields_list).
+    ``missing_fields_list`` is a list of dicts describing required fields the
+    generated code could not fill because no backing data was available.
     """
     log.info(f"Executing fill code ({len(code)} chars)")
 
@@ -121,8 +124,30 @@ def execute_fill_code(code: str, pdf_bytes: bytes, family_data: dict) -> bytes:
     if not isinstance(result, bytes):
         raise RuntimeError(f"fill_form() returned {type(result).__name__}, expected bytes")
 
-    log.info(f"Fill code produced {len(result)} bytes of PDF")
-    return result
+    # Capture any fields the generated code flagged as missing (no backing data)
+    missing_fields = namespace.get("MISSING_FIELDS", [])
+    if not isinstance(missing_fields, list):
+        missing_fields = []
+    # Normalize: keep only dict entries with at least a label
+    clean_missing = []
+    seen = set()
+    for m in missing_fields:
+        if isinstance(m, dict) and m.get("label"):
+            key = (m.get("label"), m.get("page"))
+            if key not in seen:
+                seen.add(key)
+                clean_missing.append({
+                    "label": str(m.get("label"))[:200],
+                    "page": m.get("page"),
+                    "hint": str(m.get("hint", ""))[:300],
+                })
+        elif isinstance(m, str) and m.strip():
+            if m not in seen:
+                seen.add(m)
+                clean_missing.append({"label": m[:200], "page": None, "hint": ""})
+
+    log.info(f"Fill code produced {len(result)} bytes of PDF; {len(clean_missing)} missing field(s)")
+    return result, clean_missing
 
 
 def rewrite_asset_paths(code: str) -> str:
