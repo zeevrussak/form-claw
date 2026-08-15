@@ -8,4 +8,4 @@ WEBHOOK_URL = "https://formclaw-processor-1062781559437.us-central1.run.app/webh
 # WEBHOOK_SECRET moved to Cloudflare Worker secrets (wrangler secret put WEBHOOK_SECRET)
 # WEBHOOK_SECRET = "<set via wrangler secret put>"
 # Comma-separated whitelisted senders
-WHITELISTED_SENDERS = "k6622024@gmail.com,targetmailbox@gmail.com,2396119@gmail.com,zeev@infiniplex.life"
+WHITELISTED_SENDERS = "k6622024@gmail.com,targetmailbox@gmail.com,2396119@gmail.com,zeev@infiniplex.life,russakbot@gmail.com"
