@@ -122,6 +122,9 @@ export default {
         messageId,
         inReplyTo: message.headers.get('in-reply-to') || '',
         references: message.headers.get('references') || '',
+        // Include the reply body so pending-form answers can be parsed
+        textBody: parsed.text || '',
+        htmlBody: parsed.html || '',
         attachmentSummary,
         receivedAt: new Date().toISOString(),
       };
