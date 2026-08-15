@@ -1,0 +1,56 @@
+name: Deploy Form Processor
+
+# Invoke this manually from the GitHub UI:
+#   Actions -> "Deploy Form Processor" -> "Run workflow"
+# It also runs automatically on pushes to main that touch processor/**.
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Optional note for why you are deploying (shown in the run title)'
+        required: false
+        default: 'Manual rebuild & deploy'
+  push:
+    branches: [main]
+    paths: ['processor/**']
+
+run-name: >-
+  Deploy processor ${{ github.event_name == 'workflow_dispatch' && format('({0})', inputs.reason) || '(push)' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: formclaw-processor
+          source: ./processor
+          region: us-central1
+          project_id: gen-lang-client-0082803425
+          flags: |
+            --memory=1Gi
+            --cpu=1
+            --timeout=300
+            --min-instances=0
+            --max-instances=3
+            --allow-unauthenticated
+
+      - name: Show deployed URL
+        run: echo "Deployed ${{ steps.deploy.outputs.url || 'formclaw-processor' }}"
