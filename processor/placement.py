@@ -49,12 +49,12 @@ log = logging.getLogger("formclaw.placement")
 # ── Tunables ──────────────────────────────────────────────────────────────────
 RENDER_DPI = 150.0            # raster resolution for line / ink detection
 CELL_PAD = 3.0                # keep this far away from every cell border (pt)
-INK_CLEAR = 1.5               # keep this far away from pre-printed ink (pt)
+INK_CLEAR = 3.5               # keep this far away from pre-printed ink (pt)
 MAX_INK_OVERLAP = 0.02        # >2 % of the draw box on printed ink == collision
 UNDERLINE_WINDOW = 26.0       # look this far below a label for its ruled blank
 BASELINE_GAP = 1.5            # sit this far above the underline (pt)
-MIN_BLANK_W = 18.0            # a usable blank must be at least this wide (pt)
-MIN_BLANK_H = 9.0             # ...and this tall
+MIN_BLANK_W = 11.0            # a usable blank must be at least this wide (pt)
+MIN_BLANK_H = 8.0             # ...and this tall
 LINE_MIN_LEN_PT = 12.0        # ignore ruled segments shorter than this
 VLINE_MIN_LEN_PT = 14.0       # vertical borders must be at least this tall
 VLINE_TOUCH_TOL = 5.0         # a real border ends within this of a horizontal rule
@@ -62,11 +62,22 @@ ROW_MERGE_TOL = 3.0           # horizontal rules this close are the same row edg
 MAX_ROW_H = 96.0              # taller than this is not a single form row
 VSPAN_FRACTION = 0.55         # a border must span this much of the row to split it
 VALUE_GAP = 3.0               # minimum gap between two placed values (pt)
+TOP_CLEARANCE = 1.5           # air between a value and the caption above it (pt)
+                              # (must match form_filler_v2.TOP_CLEARANCE)
 
-TARGET_FONT_SIZE = 14.0       # the size values should render at (must match
-                              # form_filler_v2.MIN_FONT_SIZE)
-AVG_CHAR_W_LATIN = 0.52       # mean advance / font size, Helvetica digits+letters
-AVG_CHAR_W_HEBREW = 0.56      # mean advance / font size, Hebrew face
+TARGET_FONT_SIZE = 14.0       # the size values should render at when the blank
+                              # allows (must match form_filler_v2.TARGET_FONT_SIZE)
+FLOOR_FONT_SIZE = 6.0         # never size below this (must match form_filler_v2)
+# Mean advance per character, expressed against the NOMINAL font size (i.e. the
+# face's optical multiplier is already folded in — see form_filler_v2._OPTICAL).
+# Measured from the two house faces with reportlab's own metrics.
+AVG_CHAR_W_LATIN = 0.40       # Playzone digits / e-mail / date text
+AVG_CHAR_W_HEBREW = 0.52      # FtPilKahol2 Hebrew letters
+# How many nominal points of type fit in one point of measured blank height.
+# The handwriting Hebrew face draws taller for the same nominal size, so it gets
+# the smaller ratio. Both mirror form_filler_v2.fit_font_size's height cap.
+HEIGHT_TO_SIZE_HEBREW = 1.10
+HEIGHT_TO_SIZE_LATIN = 1.35
 
 PLACEMENTS = ("in_box", "left_of_label", "below_label", "above_label", "right_of_label")
 
@@ -80,6 +91,26 @@ def needed_width(value, font_size: float = TARGET_FONT_SIZE,
         return 0.0
     k = AVG_CHAR_W_HEBREW if is_hebrew else AVG_CHAR_W_LATIN
     return n * font_size * k
+
+
+def fitted_font_size(value, width: float, height: float, is_hebrew: bool = False,
+                     target: float = TARGET_FONT_SIZE) -> float:
+    """Largest font size at which ``value`` fits a ``width`` x ``height`` blank.
+
+    A blank narrower than the value is NOT a defect to report — it is a size to
+    solve for. This mirrors ``form_filler_v2.fit_font_size`` so the plan carries
+    the size the renderer will actually use.
+    """
+    n = len(str(value or ""))
+    size = float(target)
+    if height and height > 1.0:
+        ratio = HEIGHT_TO_SIZE_HEBREW if is_hebrew else HEIGHT_TO_SIZE_LATIN
+        usable = max(1.0, height - BASELINE_GAP - TOP_CLEARANCE)
+        size = min(size, max(FLOOR_FONT_SIZE, usable * ratio))
+    if n and width and width > 0:
+        k = AVG_CHAR_W_HEBREW if is_hebrew else AVG_CHAR_W_LATIN
+        size = min(size, width / (n * k))
+    return round(max(FLOOR_FONT_SIZE, size), 1)
 
 # Placement preference order. Hebrew never falls through to right_of_label.
 HEBREW_ORDER = ("in_box", "left_of_label", "below_label", "above_label")
@@ -661,6 +692,221 @@ def _is_rtl_label(fill: dict, default: bool) -> bool:
     return default
 
 
+# ── Duplicated person blocks (the parents table) ──────────────────────────────
+#
+# A Hebrew school form prints the parent block TWICE side by side: two identical
+# "הורה" panels, each with its own שם פרטי / מספר ת"ז / תאריך לידה ... captions.
+# Every caption therefore appears twice on the same row, and a vision model that
+# matches a field to "the caption that reads שם פרטי" can easily lock onto the
+# WRONG copy. The observed failure was exactly that: the mother's first name was
+# written into the father's panel, on top of his row.
+#
+# The fix is structural, not statistical: all of one person's fields must live in
+# ONE panel. Any field whose label sits in the other panel is moved to the
+# matching cell of its own panel — matched by position within the panel, counting
+# from the panel's right edge, because the panels are translated copies.
+
+# The form's parent panels are identical and unlabelled; the RTL convention (and
+# the fill-plan prompt) puts the father in the first, right-hand panel.
+PREFERRED_RIGHT_PERSON = "father"
+
+_PERSON_MARKERS = (
+    ("father", ("(אב)", "אב", "האב", "father", "dad", "הורה 1", "הורה א")),
+    ("mother", ("(אם)", "אם", "האם", "mother", "mom", "הורה 2", "הורה ב")),
+)
+
+
+def person_of(fill: dict) -> str | None:
+    """Which family member this fill belongs to: 'father', 'mother' or None.
+
+    Prefers the plan's explicit ``person`` key; falls back to the (אב)/(אם)
+    marker the prompt asks the model to append to duplicated captions.
+    """
+    explicit = str(fill.get("person") or "").strip().lower()
+    if explicit in ("father", "mother"):
+        return explicit
+    text = " ".join(str(fill.get(k) or "") for k in ("label", "field_id"))
+    for who, markers in _PERSON_MARKERS:
+        for m in markers:
+            if m in text:
+                return who
+    return None
+
+
+def _band_cells(geom: PageGeometry, y: float) -> list:
+    """All cells whose row band contains ``y``, ordered LEFT to RIGHT."""
+    same = [c for c in geom.cells if c[1] - 1.0 <= y <= c[3] + 1.0]
+    return sorted(same, key=lambda c: c[0])
+
+
+def panel_divider(geom: PageGeometry, ys: Sequence[float]) -> float | None:
+    """x of the border that splits a duplicated-panel table into two halves.
+
+    Derived from the measured cell grid, not from where the model thinks the
+    labels are: a row of a duplicated panel has an even number of cells, and the
+    panels meet at the middle border. Taking the median over every row the plan
+    touches makes this robust to one misdetected row.
+    """
+    cands = []
+    for y in ys:
+        row = _band_cells(geom, y)
+        n = len(row)
+        if n >= 2 and n % 2 == 0:
+            cands.append(row[n // 2][0])
+    if not cands:
+        return None
+    cands.sort()
+    return cands[len(cands) // 2]
+
+
+def _same_cell(a, b) -> bool:
+    return abs(a[0] - b[0]) < 0.6 and abs(a[2] - b[2]) < 0.6 and \
+        abs(a[1] - b[1]) < 0.6 and abs(a[3] - b[3]) < 0.6
+
+
+def _twin_cell(geom: PageGeometry, cell, divider: float, want_right: bool):
+    """The cell holding the same caption in the OTHER copy of the panel.
+
+    Panels are translated copies of one layout, so the n-th cell counted from a
+    panel's RIGHT edge is the same field in both panels — which holds even when
+    the two panels are not the same overall width (the outer column of the left
+    panel on this form is wider than its counterpart).
+    """
+    row = _band_cells(geom, (cell[1] + cell[3]) / 2.0)
+    right = sorted([c for c in row if (c[0] + c[2]) / 2.0 >= divider],
+                   key=lambda c: c[2], reverse=True)
+    left = sorted([c for c in row if (c[0] + c[2]) / 2.0 < divider],
+                  key=lambda c: c[2], reverse=True)
+    if not right or len(right) != len(left):
+        return None                      # not a cleanly duplicated row
+    src, dst = (left, right) if want_right else (right, left)
+    idx = next((i for i, c in enumerate(src) if _same_cell(c, cell)), -1)
+    if idx < 0 or idx >= len(dst):
+        return None
+    return dst[idx]
+
+
+def enforce_person_blocks(page_fills: Sequence[dict], geom: PageGeometry) -> int:
+    """Pull every field of one person into that person's own panel.
+
+    Returns the number of label bboxes corrected. Fills are mutated in place.
+    """
+    tagged: dict[str, list] = {}
+    for f in page_fills:
+        lb = f.get("label_bbox")
+        if not (isinstance(lb, (list, tuple)) and len(lb) == 4):
+            continue
+        who = person_of(f)
+        if who:
+            tagged.setdefault(who, []).append(f)
+
+    if len(tagged) < 2 or any(len(v) < 2 for v in tagged.values()):
+        return 0                          # nothing to cross-check
+
+    def cx(f):
+        lb = f["label_bbox"]
+        return (float(lb[0]) + float(lb[2])) / 2.0
+
+    def cy(f):
+        lb = f["label_bbox"]
+        return (float(lb[1]) + float(lb[3])) / 2.0
+
+    all_fills = [f for fl in tagged.values() for f in fl]
+    divider = panel_divider(geom, [cy(f) for f in all_fills])
+    if divider is None:
+        return 0
+
+    # Which person owns which panel: majority vote, tie broken by median x.
+    score = {}
+    for who, fl in tagged.items():
+        right = sum(1 for f in fl if cx(f) >= divider)
+        xs = sorted(cx(f) for f in fl)
+        score[who] = (right - (len(fl) - right), xs[len(xs) // 2])
+    ordered = sorted(tagged, key=lambda w: score[w], reverse=True)
+    who_right, who_left = ordered[0], ordered[-1]
+    if who_right == who_left:
+        return 0
+    # The form is RTL, so the first parent panel is the right-hand one and the
+    # convention (and the fill-plan prompt) puts the father there. Only apply
+    # that as a tie-break: if the plan itself clearly put one parent on a given
+    # side, respect the plan.
+    if len(ordered) == 2 and score[ordered[0]][0] == score[ordered[1]][0] \
+            and PREFERRED_RIGHT_PERSON in tagged:
+        who_right = PREFERRED_RIGHT_PERSON
+        who_left = next(w for w in tagged if w != who_right)
+
+    fixed = 0
+    for who, want_right in ((who_right, True), (who_left, False)):
+        for f in tagged[who]:
+            if (cx(f) >= divider) == want_right:
+                continue                  # already in this person's panel
+            lb = [float(v) for v in f["label_bbox"]]
+            cell = geom.box_containing((lb[0] + lb[2]) / 2.0, (lb[1] + lb[3]) / 2.0)
+            if not cell:
+                log.warning(f"placement: '{f.get('label')}' is in the wrong parent "
+                            f"panel but its label is not inside any cell — left as-is")
+                continue
+            twin = _twin_cell(geom, cell, divider, want_right)
+            if not twin:
+                log.warning(f"placement: '{f.get('label')}' is in the wrong parent "
+                            f"panel but no matching cell was found — left as-is")
+                continue
+            # Captions are flush with the cell's right edge in an RTL panel, so
+            # align the label's right edge with the twin cell's right edge.
+            dx = twin[2] - cell[2]
+            f["label_bbox"] = [round(lb[0] + dx, 1), round(lb[1], 1),
+                               round(lb[2] + dx, 1), round(lb[3], 1)]
+            f["placement_correction"] = (
+                f"moved into the {who}'s own panel (the label had been matched to "
+                f"the duplicate caption {abs(dx):.0f}pt away)")
+            log.warning(f"placement: '{f.get('label')}' was matched to the wrong "
+                        f"parent panel; shifted {dx:+.0f}pt into the {who}'s panel")
+            fixed += 1
+    return fixed
+
+
+# Captions that must be present for a person once that person appears in the
+# plan at all. Keyed by a short name used in the gap report.
+_REQUIRED_PERSON_FIELDS = {
+    "name": ("שם פרטי", "first name", "שם"),
+    "id": ('ת"ז', "תז", "ת.ז", "id number", "מספר זהות", "תעודת זהות"),
+}
+
+
+def audit_plan_gaps(fill_plan: dict) -> list:
+    """Report parents whose panel got some fields but not the essential ones.
+
+    The observed failure was a plan that filled one parent's birth date, phone
+    and email but neither parent's name or ID number. That is never a legitimate
+    outcome, so it is surfaced as a gap the caller can retry on.
+    """
+    fills = [f for f in (fill_plan.get("fills") or []) if isinstance(f, dict)]
+    declared_missing = " ".join(
+        str(m.get("label") if isinstance(m, dict) else m)
+        for m in (fill_plan.get("missing_fields") or [])
+    )
+    by_person: dict[str, list] = {}
+    for f in fills:
+        who = person_of(f)
+        if who:
+            by_person.setdefault(who, []).append(f)
+
+    gaps = []
+    for who, group in by_person.items():
+        labels = " ".join(str(f.get("label") or "") + " " + str(f.get("field_id") or "")
+                          for f in group).lower()
+        for key, markers in _REQUIRED_PERSON_FIELDS.items():
+            if any(m.lower() in labels for m in markers):
+                continue
+            # already acknowledged as unavailable? then it is not a gap
+            if any(m in declared_missing for m in markers):
+                continue
+            gaps.append({"person": who, "missing": key,
+                         "detail": f"{who} has {len(group)} field(s) in the plan "
+                                   f"but no {key} field"})
+    return gaps
+
+
 def apply_placement(fill_plan: dict, pdf_bytes: bytes) -> dict:
     """Re-place every fill in the plan using measured page geometry.
 
@@ -687,7 +933,7 @@ def apply_placement(fill_plan: dict, pdf_bytes: bytes) -> dict:
 
     suppressed = []
     stats = {"measured": 0, "relocated": 0, "kept": 0, "suppressed": 0,
-             "marks_snapped": 0, "tight_blanks": 0}
+             "marks_snapped": 0, "shrunk_to_fit": 0, "panel_corrections": 0}
     # Hebrew forms unless the plan says otherwise.
     rtl_default = str(fill_plan.get("form_direction", "rtl")).lower() != "ltr"
 
@@ -698,6 +944,14 @@ def apply_placement(fill_plan: dict, pdf_bytes: bytes) -> dict:
             log.error(f"placement: could not measure page {page_no}: {e}")
             continue
         stats["measured"] += 1
+
+        # A duplicated parent panel makes every caption appear twice on a row;
+        # make sure each person's fields all sit in that person's own panel
+        # BEFORE any of them claim space.
+        try:
+            stats["panel_corrections"] += enforce_person_blocks(page_fills, geom)
+        except Exception as e:
+            log.error(f"placement: parent-panel check failed on page {page_no}: {e}")
 
         taken: list[tuple] = []
         # Place the most constrained fields first: narrow blanks before wide ones.
@@ -739,6 +993,8 @@ def apply_placement(fill_plan: dict, pdf_bytes: bytes) -> dict:
                 if _score(geom, rect, taken) > 0:
                     f.setdefault("fill_placement", "as_planned")
                     f["placement_reason"] = "no label bbox; LLM coordinates verified clean"
+                    f["font_size"] = fitted_font_size(f.get("value"), w, h,
+                                                      bool(f.get("is_hebrew")))
                     taken.append(rect)
                     stats["kept"] += 1
                 else:
@@ -765,17 +1021,20 @@ def apply_placement(fill_plan: dict, pdf_bytes: bytes) -> dict:
                 continue
 
             f.update(pl.as_dict())
-            # Tell the caller whether the value will fit at the target size or
-            # will have to be shrunk — the audit's #1 defect was unreadable text.
-            fits = need_w <= 0 or pl.width + 0.5 >= need_w
-            f["fits_at_target_font"] = bool(fits)
+            # A blank narrower than the value is not an error to report back —
+            # it is a size to solve for. Work out the largest size that fits the
+            # measured blank and hand it to the renderer.
+            size = fitted_font_size(f.get("value"), pl.width, pl.height,
+                                    bool(f.get("is_hebrew")))
+            f["font_size"] = size
             f["needed_width"] = round(need_w, 1)
-            if not fits:
-                stats["tight_blanks"] += 1
-                log.warning(
-                    f"placement: '{f.get('label')}' (page {page_no}) has only "
-                    f"{pl.width:.0f}pt but needs {need_w:.0f}pt at "
-                    f"{TARGET_FONT_SIZE:.0f}pt — the value will be shrunk to fit"
+            f["fits_at_target_font"] = bool(size >= TARGET_FONT_SIZE - 0.05)
+            if not f["fits_at_target_font"]:
+                stats["shrunk_to_fit"] += 1
+                log.info(
+                    f"placement: '{f.get('label')}' (page {page_no}) has "
+                    f"{pl.width:.0f}pt for a value needing {need_w:.0f}pt at "
+                    f"{TARGET_FONT_SIZE:.0f}pt — rendering it at {size:.1f}pt"
                 )
             stats["relocated"] += 1
             if pl.anchor == "right":
@@ -798,6 +1057,12 @@ def apply_placement(fill_plan: dict, pdf_bytes: bytes) -> dict:
                 missing.append({"label": f["label"], "page": f.get("page"),
                                 "hint": f"could not be placed automatically: {f['_suppressed']}"})
 
+    gaps = audit_plan_gaps(fill_plan)
+    if gaps:
+        fill_plan["plan_gaps"] = gaps
+        for g in gaps:
+            log.warning(f"plan gap: {g['detail']}")
+    stats["plan_gaps"] = len(gaps)
     fill_plan["placement_stats"] = stats
     log.info(f"placement: {stats}")
     return fill_plan

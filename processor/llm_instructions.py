@@ -116,6 +116,16 @@ value should be written** — NOT the coordinates of the printed label.
   Keep their fill areas separate; never merge them.
 - **שכונה** = neighborhood — its own field.
 
+#### Repeated blocks (parents table)
+A parents table prints the SAME panel of captions twice, side by side (two
+blocks headed הורה). Report EVERY copy as its own field with its OWN
+`label_bbox` — do not collapse the two copies into one field. Give the two
+copies different `field_id`s and mark which side each is on, e.g.
+`"parent_right_first_name"` / `"parent_left_first_name"`. The captions to expect
+in each panel are שם פרטי, מספר ת"ז, ארץ לידה, תאריך לידה, מקום עבודה, עיסוק,
+טלפון בעבודה, טלפון נייד, כתובת אלקטרונית, מצב משפחתי. Missing one copy of a
+caption means one parent's cell can never be filled.
+
 ### Identify the form + target person
 - `form_purpose` — brief description; `issuing_body` — organization if visible.
 - `target_person` from subject/body/name hints: סביון (Savyon), כליל (Clil),
@@ -231,9 +241,31 @@ place. Never emit `fill_placement: "right_of_label"` for a Hebrew field.
 ### Value mapping rules
 - Match the child to the correct entry in `family_data["children"]` using
   `target_person`. Use the child's data for student fields.
-- Two parent columns: the RIGHT column on the form is one הורה (parent), the LEFT
-  column is the other. Put the father in one and the mother in the other; keep
-  each parent's own name/ID/phone/email/birthdate together in the same column.
+
+#### The duplicated parent panel — read this twice
+The parents table prints the SAME panel twice, side by side: two blocks both
+headed הורה, each containing its own שם פרטי / מספר ת"ז / ארץ לידה / תאריך לידה /
+מקום עבודה / עיסוק / טלפון בעבודה / טלפון נייד / כתובת אלקטרונית / מצב משפחתי.
+Every one of those captions therefore appears TWICE on the same row.
+
+- Put the FATHER in one whole panel and the MOTHER in the other whole panel.
+  Assign the father to the RIGHT panel and the mother to the LEFT panel unless
+  the form itself says otherwise.
+- Add `"person": "father"` or `"person": "mother"` to every fill in this table,
+  and append the marker to the label: `"שם פרטי (אב)"`, `"מספר ת\"ז (אם)"`.
+  A downstream check uses this to verify the field really is in that parent's
+  panel and moves it if the label_bbox picked the duplicate caption.
+- The `label_bbox` you return MUST be the caption inside THAT parent's own
+  panel. Two fills for the same person must never have label_bboxes on opposite
+  sides of the table, and two fills for DIFFERENT people must never share one.
+- Fill EVERY cell of BOTH panels for which a value exists. In particular
+  `שם פרטי` and `מספר ת"ז` are required for BOTH parents — a panel that gets a
+  birth date or a phone but no name and no ID number is a bug, not a choice.
+  If a value genuinely does not exist in the data, put that exact cell in
+  `missing_fields`; never leave it silently blank.
+- Work panel by panel: emit the father's full set of fills, then the mother's
+  full set, and count them before returning. If one person has more fills than
+  the other, you skipped a cell — go back and add it.
 - Hebrew names → use the `*_hebrew` fields. IDs, phones, emails, dates → use the
   raw LTR values. Dates in the family data are `DD-MM-YYYY`; output them as
   `DD/MM/YYYY`.
@@ -283,6 +315,19 @@ place. Never emit `fill_placement: "right_of_label"` for a Hebrew field.
       "label_bbox": [900, 548, 962, 566],
       "fill_placement": "in_box",
       "value": "כליל"
+    }},
+    {{
+      "field_id": "father_id_p1",
+      "label": "מספר ת\"ז (אב)",
+      "person": "father",
+      "page": 1,
+      "field_type": "text",
+      "fill_x": 690, "fill_y": 366, "fill_width": 95, "fill_height": 20,
+      "fill_anchor": "right",
+      "is_hebrew": false,
+      "label_bbox": [790, 362, 852, 378],
+      "fill_placement": "in_box",
+      "value": "034954990"
     }}
   ],
   "missing_fields": [

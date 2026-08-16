@@ -279,6 +279,8 @@ async def _analyze_generate_fill_and_reply(
     for sup in (fill_plan.get("suppressed_fills") or []):
         log.warning(f"Placement suppressed '{sup.get('label')}' "
                     f"(page {sup.get('page')}): {sup.get('reason')}")
+    for gap in (fill_plan.get("plan_gaps") or []):
+        log.warning(f"Plan gap: {gap.get('detail')}")
     log.info(f"Fill plan preview:\n{json.dumps(fill_plan, ensure_ascii=False)[:2000]}")
 
     # ----- Render the fill plan deterministically (with one retry) -----
@@ -308,6 +310,16 @@ async def _analyze_generate_fill_and_reply(
             # If nothing was drawn AND nothing was flagged missing, the plan was
             # likely empty/bad — retry. Otherwise accept (a form that is all
             # missing fields legitimately produces little overlay content).
+            # A parent panel that came back with a birth date but no name and
+            # no ID number is a broken plan, not a valid partial fill — retry it
+            # once before accepting the render.
+            gaps = fill_plan.get("plan_gaps") or []
+            if gaps and attempt < max_attempts:
+                log.warning(
+                    f"Plan is incomplete ({'; '.join(g['detail'] for g in gaps)}) "
+                    f"— regenerating the fill plan")
+                continue
+
             if fill_quality["passed"] or missing_fields:
                 break
             else:
