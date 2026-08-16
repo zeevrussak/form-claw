@@ -39,52 +39,88 @@ Each image has a **coordinate-grid overlay** drawn on top of it:
   BOTTOM-LEFT, y increasing UPWARD. Read field positions directly off this grid.
 - The red/blue grid lines and their numbers are NOT part of the form — ignore
   them as content; use them ONLY as a ruler to report accurate coordinates.
-- When you report `x`/`y` for a field, read them from the grid. For a field on
-  an underline, report the `x` where the value should START (right edge for
-  RTL-anchored text) and the `y` of the underline itself.
 
 ### Email Context
 - **Subject:** "{subject}"
 - **Body:** "{body}"
 
-### Instructions
+### YOUR JOB: locate the BLANK FILL AREA of every field
+For each field you must return the coordinates of the **empty space where the
+value should be written** — NOT the coordinates of the printed label.
 
-1. **Identify every fillable field** on every page. For each field, return:
-   - `label` — The visible Hebrew (and/or English) label text.
-   - `label_english` — English translation if the label is in Hebrew.
-   - `field_type` — One of: `text`, `date`, `checkbox`, `radio`, `signature`,
-     `id_digits` (nine boxes for Teudat Zehut), `phone`, `address`, `select`.
-   - `page` — Page number (1-indexed).
-   - `x`, `y` — Approximate coordinates in PDF points from bottom-left origin.
-   - `width`, `height` — Approximate field dimensions in PDF points.
-   - `is_selection` — `true` if the field requires choosing one option from
-     an OR (`/`, `או`) pair. List the options in `options` array.
-   - `options` — Array of option strings if `is_selection` is `true`.
-   - `expected_value_hint` — What kind of data goes here
-     (e.g., "parent full name", "child ID", "date DD/MM/YYYY").
+#### Hebrew layout rules (CRITICAL — these were violated before)
+1. Hebrew reads RIGHT-TO-LEFT. A label like `שם פרטי:` sits at the RIGHT of its
+   blank; the value is written in the empty space to the **LEFT** of the label
+   (or in the cell area BELOW the label in a table). The value NEVER goes to the
+   right of the label text.
+2. An **empty underline** to the left of, or below, a label is THE fill target.
+   Report the underline's position.
+3. In a **table cell**: the label is printed at the TOP-RIGHT of the cell; the
+   fill area is the empty part of the cell (to the left of the label and/or the
+   lower portion of the cell). Put the value there — never on top of the label.
+4. `fill_x`/`fill_y` = the blank fill area, positioned so the value will not
+   overlap the printed label.
 
-2. **Detect selection constructs** — Hebrew forms often have constructs like
-   `אב / אם` (Father / Mother), `כן / לא` (Yes / No), or slashed alternatives.
-   Mark these as `is_selection: true` and list the options.
+#### For every field return these fill-target coordinates
+- `label` — visible Hebrew (and/or English) label text.
+- `label_english` — English translation of the label.
+- `field_type` — one of: `text`, `date`, `checkbox`, `radio`, `signature`,
+  `id_digits` (the 9-box Teudat Zehut grid), `phone`, `email`, `address`, `select`.
+- `page` — page number (1-indexed).
+- `fill_x` — x of the fill area. For RTL Hebrew text: the **RIGHT edge** of the
+  blank space (where right-anchored text starts). For LTR data and centered
+  boxes: the LEFT edge of the blank space.
+- `fill_y` — y of the underline / bottom of the blank cell (the baseline the
+  text should sit on).
+- `fill_width` — width of the blank space in points (from its left wall to its
+  right edge). Used to auto-fit long values and to center digit boxes.
+- `fill_height` — height of the blank space / cell in points.
+- `fill_anchor` — `"right"` for Hebrew text (RTL), `"left"` for LTR data
+  (numbers, IDs, emails, dates, phones), `"center"` for id_digits / checkboxes /
+  radio circles.
+- `is_hebrew` — `true` if the VALUE that goes here will be Hebrew letters;
+  `false` for numbers, IDs, dates, emails, phones.
+- `is_selection` — `true` if the field is an OR choice (`/`, `או`) pair.
+- `options` — for a selection, an array of objects
+  `{{"text": "...", "x": <center x>, "y": <baseline y>, "width": <pts>, "height": <pts>}}`
+  giving the position of EACH option word so a circle can be drawn around the
+  chosen one. Empty array otherwise.
+- `label_bbox` — `[x0, y0, x1, y1]` bounding box of the **printed label text
+  itself** (not the fill area). REQUIRED for every field. A downstream
+  measurement step uses this to find the real blank next to the label, so give
+  it as tightly as you can: only the caption glyphs, excluding the colon's
+  trailing whitespace and excluding any ruled line.
+- `fill_placement` — where the value must go RELATIVE TO THE LABEL. One of:
+  - `in_box` — same box/cell as the label, in its empty part (the normal case
+    for a bordered table cell whose caption sits at the top-right).
+  - `left_of_label` — on the ruled blank that continues to the LEFT of the
+    label on the same line (`label: ______`). The normal case for Hebrew
+    free-text lines.
+  - `below_label` — on the ruled blank directly UNDER the label.
+  - `above_label` — only when the blank is genuinely above the caption.
+  - `right_of_label` — **FORBIDDEN for Hebrew fields.** Hebrew reads
+    right-to-left, so the space to the right of a Hebrew caption belongs to the
+    previous field; writing there collides with it. Use this ONLY for a
+    left-to-right caption on an English form.
+- `expected_value_hint` — specific description of the data
+  (e.g. "child first name", "child ID number (9 digits)", "postal code / zip",
+  "city / town", "neighborhood", "father mobile phone", "date DD/MM/YYYY").
 
-3. **Detect signature regions** — Look for the word חתימה (signature) or
-   dotted/lined areas with labels like "חתימת הורה" (parent signature).
-   Indicate whether it expects father, mother, or either.
+#### Field-type specifics
+- **id_digits**: the 9-box ת"ז grid. Set `fill_anchor:"center"`, `fill_x` = LEFT
+  edge of the whole grid, `fill_width` = total width of all 9 boxes together.
+- **radio / selection** (e.g. `ז / נ`, `אב / אם`, `כן / לא`): set
+  `is_selection:true` and fill `options` with each option's own position.
+- **signature**: look for חתימה / חתימת הורה. Note whether father/mother/either.
+- **מיקוד** = postal/zip code — a DISTINCT field from **ישוב**/**עיר** (city).
+  Keep their fill areas separate; never merge them.
+- **שכונה** = neighborhood — its own field.
 
-4. **Identify the form's purpose** — Read the title, headers, and any
-   ministry/institution logos to determine:
-   - `form_purpose` — Brief description (e.g., "School trip consent form").
-   - `issuing_body` — Organization name if visible.
-   - `target_role` — Who the form is about (child, parent, family).
-
-5. **Determine the target person** from the email subject/body hints:
-   - Look for names: סביון (Savyon), כליל (Clil), קרן (Keren), זאב (Ze'ev).
-   - Look for school names: תלי = Savyon, בן גוריון = Clil.
-   - Look for "בשביל", "עבור", "for" keywords.
-   - Return `target_person` and `signer` (who should sign).
-
-6. **Page layout** — Note page orientation (portrait/landscape), margins,
-   and any header/footer regions to avoid.
+### Identify the form + target person
+- `form_purpose` — brief description; `issuing_body` — organization if visible.
+- `target_person` from subject/body/name hints: סביון (Savyon), כליל (Clil),
+  קרן (Keren), זאב (Ze'ev). School: תלי = Savyon, בן גוריון = Clil.
+- `signer` — who should sign (mother/father/both).
 
 ### Output Format
 Return ONLY valid JSON with this structure:
@@ -101,17 +137,21 @@ Return ONLY valid JSON with this structure:
       "orientation": "portrait",
       "fields": [
         {{
-          "label": "...",
-          "label_english": "...",
+          "label": "שם פרטי",
+          "label_english": "first name",
           "field_type": "text",
           "page": 1,
-          "x": 400,
-          "y": 700,
-          "width": 150,
-          "height": 20,
+          "fill_x": 780,
+          "fill_y": 552,
+          "fill_width": 120,
+          "fill_height": 22,
+          "fill_anchor": "right",
+          "is_hebrew": true,
           "is_selection": false,
           "options": [],
-          "expected_value_hint": "..."
+          "label_bbox": [900, 548, 962, 566],
+          "fill_placement": "in_box",
+          "expected_value_hint": "child first name"
         }}
       ]
     }}
@@ -121,7 +161,139 @@ Return ONLY valid JSON with this structure:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CODE GENERATION PROMPT
+# FILL PLAN PROMPT  (NEW — replaces code generation)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+FILL_PLAN_SYSTEM = """You are Form Claw Fill Planner. Given a form field analysis
+(with fill-area coordinates) and a family's data, you decide WHAT VALUE goes in
+each field and produce a machine-readable JSON fill plan.
+
+You do NOT write code and you do NOT compute positions — the coordinates are
+already provided in the analysis. Your only job is mapping the right data value
+to each field, or marking it missing when no data exists.
+
+Absolute rule: NEVER invent, guess, or use a placeholder value. Only use values
+that are actually present in the provided family data / knowledge. If a required
+field has no backing value, put it in `missing_fields` and leave it out of
+`fills`. A blank field is correct; an invented value is a critical failure."""
+
+
+def build_fill_plan_prompt(
+    analysis: str,
+    target_person: str,
+    family_data: dict,
+    knowledge: list[dict],
+    today: str | None = None,
+) -> str:
+    """Build the user prompt that asks Gemini for a JSON fill plan (no code)."""
+    import json
+
+    if today is None:
+        today = datetime.now().strftime("%d/%m/%Y")
+
+    family_json = json.dumps(family_data, ensure_ascii=False, indent=2)
+    knowledge_json = json.dumps(knowledge, ensure_ascii=False, indent=2)
+
+    return f"""Produce a JSON fill plan for this Hebrew form. NO code, NO explanation.
+
+### Form Analysis (fields with fill-area coordinates)
+{analysis}
+
+### Target Person
+{target_person}
+
+### Family Data (JSON) — the ONLY source of values
+{family_json}
+
+### Additional Knowledge Entries
+{knowledge_json}
+
+### Today's date
+{today}
+
+### What to produce
+For EVERY field in the analysis, decide the correct value from the family data
+and emit one entry in `fills`, OR — if there is no backing value — add it to
+`missing_fields` and do NOT emit a fill for it.
+
+Copy the geometry (`fill_x`, `fill_y`, `fill_width`, `fill_height`,
+`fill_anchor`, `page`, `field_type`, **`label_bbox`**, **`fill_placement`**)
+straight from the analysis into each fill. Do not recompute or "correct" them.
+
+`label_bbox` and `fill_placement` are MANDATORY on every text-like fill. After
+you return this plan, a deterministic placement step measures the actual page
+(ruled lines, table cells, pre-printed ink) and uses `label_bbox` to find the
+real blank; `fill_x/fill_y/fill_width/fill_height` are treated only as a hint
+and may be overridden. A fill with no `label_bbox` cannot be corrected, so if
+its coordinates are wrong the value is dropped rather than drawn in the wrong
+place. Never emit `fill_placement: "right_of_label"` for a Hebrew field.
+
+### Value mapping rules
+- Match the child to the correct entry in `family_data["children"]` using
+  `target_person`. Use the child's data for student fields.
+- Two parent columns: the RIGHT column on the form is one הורה (parent), the LEFT
+  column is the other. Put the father in one and the mother in the other; keep
+  each parent's own name/ID/phone/email/birthdate together in the same column.
+- Hebrew names → use the `*_hebrew` fields. IDs, phones, emails, dates → use the
+  raw LTR values. Dates in the family data are `DD-MM-YYYY`; output them as
+  `DD/MM/YYYY`.
+- Field-to-data hints:
+  - "first name" → first_name_hebrew;  "family/last name" → family_name.hebrew
+  - "ID number" / ת"ז → the 9-digit `id`
+  - "date of birth" / תאריך לידה → birth_date (reformatted DD/MM/YYYY)
+  - "city" / ישוב / עיר → address.city_hebrew
+  - "postal code" / מיקוד / zip → address.zip   (NEVER put zip in the city field)
+  - "street and number" / רחוב ומספר → address.street_hebrew
+  - "neighborhood" / שכונה → ONLY if a neighborhood value exists; otherwise MISSING
+  - "email" / כתובת אלקטרונית → the parent's email
+  - "phone" → the matching parent phone
+  - country of birth / ארץ לידה, שנת עלייה, מקום עבודה, עיסוק, טלפון בבית →
+    only if present in the data; otherwise MISSING
+- For a selection field (`is_selection: true`, e.g. `ז / נ`, `אב / אם`,
+  `כן / לא`), decide which option is correct, then emit a fill with
+  `field_type:"circle_option"` and copy that option's own `x/y/width/height`
+  from its entry in the analysis `options` array (so the circle lands on the
+  chosen word). If you cannot determine gender or another selection from the
+  data, add it to `missing_fields` instead of guessing.
+- ONE FILL = ONE FIELD. Never concatenate two field values into a single
+  `value` string. `"4334801  רעננה עפרה חזה 1"` is WRONG: street, city and zip
+  are three printed boxes and need three separate fills. The same applies to a
+  parent's name + ID, or two parents' names -- each gets its own fill with its
+  own `label_bbox`.
+- For `id_digits`, emit ONE fill with the full 9-digit string as `value`; the
+  engine splits it into the 9 boxes.
+- For `signature`, emit a fill with `field_type:"signature"` and
+  `value:"father"` or `value:"mother"` per the signer; the engine draws the PNG.
+- Only emit `value` for a field when a real value exists. Do not add conditional
+  fields (e.g. "if allergies, specify") to missing_fields when their condition
+  is false — leave them out silently.
+
+### Output Format — return ONLY this JSON
+```json
+{{
+  "fills": [
+    {{
+      "field_id": "student_first_name_p1",
+      "label": "שם פרטי",
+      "page": 1,
+      "field_type": "text",
+      "fill_x": 780, "fill_y": 552, "fill_width": 120, "fill_height": 22,
+      "fill_anchor": "right",
+      "is_hebrew": true,
+      "label_bbox": [900, 548, 962, 566],
+      "fill_placement": "in_box",
+      "value": "כליל"
+    }}
+  ],
+  "missing_fields": [
+    {{"label": "שכונה", "page": 1, "hint": "neighborhood name"}}
+  ]
+}}
+```"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CODE GENERATION PROMPT  (DEPRECATED — kept for reference, not used in v2 flow)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 CODE_GENERATION_SYSTEM = """You are Form Claw Code Generator, an expert Python developer

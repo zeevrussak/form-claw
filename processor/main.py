@@ -25,12 +25,13 @@ from pdf2image import convert_from_bytes
 from PIL import Image, ImageDraw, ImageFont
 
 from security_filter import scan_email_content
-from form_filler import execute_fill_code
+from form_filler_v2 import execute_fill_plan
+from placement import apply_placement
 from llm_instructions import (
     FORM_ANALYSIS_SYSTEM,
     build_analysis_prompt,
-    CODE_GENERATION_SYSTEM,
-    build_code_generation_prompt,
+    FILL_PLAN_SYSTEM,
+    build_fill_plan_prompt,
 )
 
 # Supported image extensions
@@ -257,37 +258,62 @@ async def _analyze_generate_fill_and_reply(
     target_person = extract_target_person(analysis, subject, text_body)
     log.info(f"Analysis complete. Target person: {target_person}")
 
-    # ----- Generate fill code -----
-    fill_code = await generate_fill_code(page_images, analysis, target_person)
-    log.info(f"Generated fill code ({len(fill_code)} chars)")
-    log.info(f"Fill code preview:\n{fill_code[:2000]}")
+    # ----- Generate a deterministic fill PLAN (JSON) — no code generation -----
+    # The LLM decides WHAT value goes WHERE (with coordinates from the analysis);
+    # the values are then rendered by a tested Python engine (form_filler_v2).
+    fill_plan = await generate_fill_plan(page_images, analysis, target_person)
+    log.info(
+        f"Generated fill plan: {len(fill_plan.get('fills', []))} fill(s), "
+        f"{len(fill_plan.get('missing_fields', []))} plan-declared missing field(s)"
+    )
 
-    # ----- Execute fill code (with retry on quality check failure) -----
+    # ----- Placement pass: decide IN / LEFT / BELOW / ABOVE for every field -----
+    # The LLM's coordinates are only a hint. This step measures the real page
+    # (ruled lines, table cells, pre-printed ink) and decides, per field, whether
+    # the value belongs inside the label's box, to its left, below it or above it,
+    # then rewrites the coordinates so nothing overprints a label or straddles a
+    # border. Anything it cannot place safely is turned into a question for the
+    # parent instead of being drawn in the wrong place.
+    fill_plan = apply_placement(fill_plan, pdf_data)
+    log.info(f"Placement pass: {fill_plan.get('placement_stats')}")
+    for sup in (fill_plan.get("suppressed_fills") or []):
+        log.warning(f"Placement suppressed '{sup.get('label')}' "
+                    f"(page {sup.get('page')}): {sup.get('reason')}")
+    log.info(f"Fill plan preview:\n{json.dumps(fill_plan, ensure_ascii=False)[:2000]}")
+
+    # ----- Render the fill plan deterministically (with one retry) -----
     max_attempts = 2
     filled_pdf = None
     fill_quality = None
     missing_fields = []
     for attempt in range(1, max_attempts + 1):
         try:
-            attempt_code = fill_code if attempt == 1 else await generate_fill_code(page_images, analysis, target_person)
             if attempt > 1:
-                log.info(f"Retry attempt {attempt}: regenerated fill code ({len(attempt_code)} chars)")
-                log.info(f"Retry code preview:\n{attempt_code[:2000]}")
-                fill_code = attempt_code
+                # Regenerate the plan once if the first render produced no content.
+                fill_plan = await generate_fill_plan(page_images, analysis, target_person)
+                fill_plan = apply_placement(fill_plan, pdf_data)
+                log.info(
+                    f"Retry attempt {attempt}: regenerated fill plan "
+                    f"({len(fill_plan.get('fills', []))} fills), "
+                    f"placement {fill_plan.get('placement_stats')}"
+                )
 
-            filled_pdf, missing_fields = execute_fill_code(fill_code, pdf_data, FAMILY_DATA)
+            filled_pdf, missing_fields = execute_fill_plan(fill_plan, pdf_data)
             log.info(f"Filled PDF: {len(filled_pdf)} bytes (attempt {attempt}); "
                      f"{len(missing_fields)} missing field(s)")
 
             fill_quality = verify_fill_quality(pdf_data, filled_pdf)
             log.info(f"Fill quality check: {fill_quality}")
 
-            if fill_quality["passed"]:
+            # If nothing was drawn AND nothing was flagged missing, the plan was
+            # likely empty/bad — retry. Otherwise accept (a form that is all
+            # missing fields legitimately produces little overlay content).
+            if fill_quality["passed"] or missing_fields:
                 break
             else:
                 log.warning(f"Fill quality check FAILED (attempt {attempt}): {fill_quality['reason']}")
                 if attempt < max_attempts:
-                    log.info("Retrying with fresh code generation...")
+                    log.info("Retrying with a fresh fill plan...")
         except Exception as e:
             log.error(f"Fill attempt {attempt} failed: {e}")
             if attempt >= max_attempts:
@@ -350,7 +376,7 @@ async def _analyze_generate_fill_and_reply(
         "llm_provider": f"google/{GEMINI_MODEL}",
         "instructions_detected": text_body.strip()[:500] if text_body.strip() else None,
         "llm_analysis": analysis[:5000] if analysis else None,
-        "generated_code": fill_code[:5000] if fill_code else None,
+        "fill_plan": json.dumps(fill_plan, ensure_ascii=False)[:5000] if fill_plan else None,
         "fill_quality": fill_quality,
     })
 
@@ -861,10 +887,15 @@ async def analyze_form(page_images: list[bytes], subject: str, body: str) -> str
         max_tokens=8192,
     )
 
-async def generate_fill_code(
+async def generate_fill_plan(
     page_images: list[bytes], analysis: str, target_person: str
-) -> str:
-    """Generate Python code to fill the form using ReportLab."""
+) -> dict:
+    """Ask Gemini for a structured JSON fill plan (no Python code).
+
+    The plan maps each analyzed field to a value from the family data (or marks
+    it missing) and carries the fill-area coordinates from the analysis. The
+    deterministic engine (form_filler_v2.execute_fill_plan) renders it.
+    """
     # Load knowledge entries for this person from Firestore
     knowledge = await load_knowledge(target_person)
 
@@ -873,7 +904,7 @@ async def generate_fill_code(
         for img in page_images
     ]
 
-    prompt = build_code_generation_prompt(
+    prompt = build_fill_plan_prompt(
         analysis=analysis,
         target_person=target_person,
         family_data=FAMILY_DATA,
@@ -882,21 +913,60 @@ async def generate_fill_code(
     content = [{"type": "text", "text": prompt}] + image_parts
     response = await call_gemini(
         [
-            {"role": "system", "content": CODE_GENERATION_SYSTEM},
+            {"role": "system", "content": FILL_PLAN_SYSTEM},
             {"role": "user", "content": content},
         ],
         max_tokens=16384,
     )
 
-    # Extract code from markdown code block
-    if "```python" in response:
-        code = response.split("```python")[1].split("```")[0]
-    elif "```" in response:
-        code = response.split("```")[1].split("```")[0]
-    else:
-        code = response
+    return _parse_fill_plan(response)
 
-    return code.strip()
+
+def _parse_fill_plan(response: str) -> dict:
+    """Extract and parse the JSON fill plan from the model response.
+
+    Tolerates ```json fences and surrounding prose. Always returns a dict with
+    at least ``fills`` and ``missing_fields`` keys.
+    """
+    text = (response or "").strip()
+
+    # Strip markdown code fences if present.
+    if "```" in text:
+        # take the content of the first fenced block
+        parts = text.split("```")
+        if len(parts) >= 3:
+            block = parts[1]
+            # drop an optional leading language tag (e.g. "json\n")
+            if "\n" in block:
+                first, rest = block.split("\n", 1)
+                if first.strip().lower() in ("json", ""):
+                    block = rest
+            text = block.strip()
+
+    plan = None
+    try:
+        plan = json.loads(text)
+    except Exception:
+        # Fallback: grab the outermost {...} object.
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                plan = json.loads(text[start:end + 1])
+            except Exception as e:
+                log.error(f"Failed to parse fill plan JSON: {e}")
+
+    if not isinstance(plan, dict):
+        log.error("Fill plan did not parse to a dict; using empty plan")
+        plan = {}
+
+    plan.setdefault("fills", [])
+    plan.setdefault("missing_fields", [])
+    if not isinstance(plan["fills"], list):
+        plan["fills"] = []
+    if not isinstance(plan["missing_fields"], list):
+        plan["missing_fields"] = []
+    return plan
 
 
 async def load_knowledge(target_person: str) -> list[dict]:
