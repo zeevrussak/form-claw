@@ -3,7 +3,7 @@
 import { signIn, useSession } from 'next-auth/react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useState, useEffect, Suspense } from 'react';
-import { AlertTriangle, Loader2 } from 'lucide-react';
+import { AlertTriangle, Loader2, Shield } from 'lucide-react';
 import Image from 'next/image';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -54,26 +54,12 @@ function LoginContent() {
 
   return (
     <div className="relative overflow-hidden flex items-center justify-center min-h-screen bg-gradient-to-br from-slate-900 via-blue-950 to-slate-900">
-      {/* Tree of life background art */}
-      <Image
-        src="/tree-of-life.png"
-        alt=""
-        width={520}
-        height={780}
-        priority
-        aria-hidden="true"
-        className="pointer-events-none select-none absolute -left-24 bottom-0 h-[90vh] w-auto object-contain opacity-20"
-      />
       <div className="relative z-10 w-full max-w-md px-4">
         <div className="text-center mb-8">
-          <Image
-            src="/infiniplex-logo.png"
-            alt="Infiniplex"
-            width={280}
-            height={80}
-            priority
-            className="mx-auto mb-4 h-16 w-auto object-contain"
-          />
+          <div className="flex items-center justify-center gap-3 mb-2">
+            <Shield className="h-12 w-12 text-blue-500" />
+            <h1 className="text-4xl font-bold text-white">Form Claw</h1>
+          </div>
           <p className="text-blue-200/70 mt-2">Automated Form-Filling Dashboard</p>
         </div>
 
