@@ -279,8 +279,18 @@ Every one of those captions therefore appears TWICE on the same row.
   - "neighborhood" / שכונה → ONLY if a neighborhood value exists; otherwise MISSING
   - "email" / כתובת אלקטרונית → the parent's email
   - "phone" → the matching parent phone
-  - country of birth / ארץ לידה, שנת עלייה, מקום עבודה, עיסוק, טלפון בבית →
+  - country of birth / ארץ לידה, שנת עלייה, טלפון בבית →
     only if present in the data; otherwise MISSING
+  - occupation / עיסוק — never guess; use the value from the data or knowledge
+    base if available, otherwise put it in `missing_fields` so the sender is
+    asked. Same for מקום עבודה (workplace).
+  - marital status / מצב משפחתי — this is a SELECTION field (circle_option):
+    the form prints options like נשוי/נשואה / גרוש/גרושה / רווק/רווקה / אלמן/אלמנה
+    etc. NEVER guess the marital status. Use the value from the data or
+    knowledge base ONLY. If no marital status is recorded, add it to
+    `missing_fields` for BOTH parents — one entry per parent — with
+    `"hint": "marital status selection"`. When a value IS known, emit a
+    `circle_option` fill that circles the matching option word.
 - For a selection field (`is_selection: true`, e.g. `ז / נ`, `אב / אם`,
   `כן / לא`), decide which option is correct, then emit a fill with
   `field_type:"circle_option"` and copy that option's own `x/y/width/height`
@@ -331,7 +341,9 @@ Every one of those captions therefore appears TWICE on the same row.
     }}
   ],
   "missing_fields": [
-    {{"label": "שכונה", "page": 1, "hint": "neighborhood name"}}
+    {{"label": "שכונה", "page": 1, "hint": "neighborhood name"}},
+    {{"label": "עיסוק (אב)", "page": 1, "person": "father", "hint": "father's occupation"}},
+    {{"label": "מצב משפחתי (אם)", "page": 1, "person": "mother", "hint": "marital status selection"}}
   ]
 }}
 ```"""
